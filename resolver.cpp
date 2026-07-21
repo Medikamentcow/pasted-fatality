@@ -80,6 +80,16 @@ void resolver::post_animate(C_CSPlayer* player, lag_record_t* record)
 				update_kalman(log, 0.35f, 0.55f);
 		}
 
+		// Extrapolated pose — reduce confidence so we don't shoot a stale locked angle
+		if (record->m_extrapolated)
+		{
+			const float extra = record->m_extrapolate_amt > 0
+				? 0.04f * static_cast<float>(record->m_extrapolate_amt)
+				: 0.06f;
+
+			log.m_kalman.variance = std::min(log.m_kalman.variance + extra, 0.50f);
+		}
+
 		const auto dir = bias_to_direction(log.m_kalman.bias);
 		log.m_mode[mode_to_write].m_side[log.m_current_side].m_current_dir = dir;
 	}
@@ -327,14 +337,10 @@ void resolver::update_animation_features(player_log_t& log, lag_record_t* record
 	const auto& animstate = record->m_state[resolver_direction::resolver_networked].m_animstate;
 	anim.eye_yaw = record->m_eye_angles.y;
 
-	// [NEW] Save previous feet_yaw BEFORE overwriting so we can detect LBY snaps.
 	anim.prev_feet_yaw = anim.feet_yaw;
 	anim.feet_yaw = animstate.foot_yaw;
 	anim.eye_feet_delta = math::normalize_float(anim.eye_yaw - anim.feet_yaw);
 
-	// [NEW] LBY snap: feet_yaw jumped more than 20 degrees in one tick.
-	// Upper bound of 170 avoids false positives from wrap-around artifacts
-	// (a genuine wrap would appear as ~360 before normalization).
 	const float feet_snap_delta = fabsf(math::normalize_float(anim.feet_yaw - anim.prev_feet_yaw));
 	anim.lby_snapped = (feet_snap_delta > 20.f && feet_snap_delta < 170.f);
 
@@ -346,6 +352,7 @@ void resolver::update_animation_features(player_log_t& log, lag_record_t* record
 
 	anim.is_moving = speed_2d > 5.f;
 	anim.is_standing = !anim.is_moving && (record->m_flags & FL_ONGROUND);
+	anim.speed_2d = speed_2d;
 
 	if (anim.is_standing)
 		++anim.standing_ticks;
@@ -363,11 +370,7 @@ void resolver::update_animation_features(player_log_t& log, lag_record_t* record
 		anim.velocity_yaw_delta = 0.f;
 	}
 
-	// ----- Extra from addon -----
 	anim.adjust_weight = record->addon.adjust_weight;
-
-	// [NEW] Choke count — how many commands were compressed into this record.
-	// Verify the field name against your lag_record_t definition.
 	anim.choke_count = record->m_lagamt;
 }
 
@@ -375,14 +378,13 @@ void resolver::update_animation_features(player_log_t& log, lag_record_t* record
 void resolver::update_kalman(player_log_t& log, float measurement, float measurement_noise)
 {
 	auto& k = log.m_kalman;
-	const auto& anim = log.m_anim;
+	auto& anim = log.m_anim;
 
 	// ---------- Sign-conflict resistance ----------
-	// When a measurement strongly contradicts a committed filter, scale up
-	// noise proportional to how committed the filter already is.
-	// This resists both jitter frames and fake side-switches without hard-blocking.
-	const bool sign_conflict = (measurement > 0.10f && k.bias < -0.10f)
-		|| (measurement < -0.10f && k.bias >  0.10f);
+	const bool sign_conflict =
+		(measurement > 0.10f && k.bias < -0.10f) ||
+		(measurement < -0.10f && k.bias > 0.10f);
+
 	if (sign_conflict && k.variance < 0.20f)
 	{
 		const float commitment = 1.f - std::clamp(k.variance / 0.20f, 0.f, 1.f);
@@ -401,11 +403,34 @@ void resolver::update_kalman(player_log_t& log, float measurement, float measure
 	if (anim.is_standing && anim.standing_ticks > 8 && fabsf(anim.eye_feet_delta) < 25.f)
 		process_noise = 0.018f;
 
-	// If filter and measurement agree on direction and filter is already committed,
-	// reduce process noise — preserve commitment through stable consistent signal.
-	if (k.variance < 0.08f && fabsf(k.bias) > 0.15f
-		&& ((measurement > 0.f) == (k.bias > 0.f)))
+	// Agreeing measurement + low variance → stickier
+	if (k.variance < 0.08f && fabsf(k.bias) > 0.15f &&
+		((measurement > 0.f) == (k.bias > 0.f)))
 		process_noise = std::max(process_noise * 0.60f, 0.010f);
+
+	// ---------- Bias trend (per-player) ----------
+	if ((k.bias > 0.f && k.bias > anim.prev_bias + 0.01f) ||
+		(k.bias < 0.f && k.bias < anim.prev_bias - 0.01f))
+	{
+		anim.bias_trend_counter++;
+	}
+	else if (fabsf(k.bias - anim.prev_bias) < 0.005f)
+	{
+		anim.bias_trend_counter = std::max(anim.bias_trend_counter - 1, 0);
+	}
+	else
+	{
+		anim.bias_trend_counter = 0;
+	}
+	anim.prev_bias = k.bias;
+
+	// Consistent trend + strong bias → slightly more confident
+	if (anim.bias_trend_counter > 8 && fabsf(k.bias) > 0.60f)
+		process_noise *= 0.75f;
+
+	// LBY snap → allow faster adaptation
+	if (anim.lby_snapped)
+		process_noise = std::max(process_noise, 0.070f);
 
 	k.variance += process_noise;
 	k.variance = std::max(k.variance, 0.004f);
@@ -418,16 +443,17 @@ void resolver::update_kalman(player_log_t& log, float measurement, float measure
 	k.bias += gain * innovation;
 	k.variance *= (1.f - gain);
 
-	// [REMOVED] k.bias *= 0.993f when measurement_noise > 0.60f.
-	// The moving-state process noise above already handles locomotion uncertainty
-	// without silently bleeding bias on every moving tick.
+	// Gentle decay on very weak measurements
+	if (measurement_noise > 0.60f)
+		k.bias *= 0.993f;
 
 	k.bias = std::clamp(k.bias, -1.f, 1.f);
 }
 
 void resolver::update_kalman_from_anim(player_log_t& log)
 {
-	const auto& anim = log.m_anim;
+	auto& anim = log.m_anim;
+	auto& k = log.m_kalman;
 
 	float measurement = 0.f;
 	float noise = 0.90f;
@@ -440,7 +466,6 @@ void resolver::update_kalman_from_anim(player_log_t& log)
 		if (anim.layer6_weight > 0.55f)
 			noise = 0.18f;
 
-		// Stronger when both lean + adjust layers are active
 		if (anim.layer6_weight > 0.55f && anim.layer12_weight > 0.40f)
 			noise = 0.13f;
 
@@ -451,20 +476,55 @@ void resolver::update_kalman_from_anim(player_log_t& log)
 		if (anim.standing_ticks > 30 && fabsf(anim.eye_feet_delta) > 22.f)
 			noise = std::max(noise - 0.03f, 0.05f);
 
-		// Standing jitter protection
-		static float last_layer6 = 0.f;
-		const float layer6_delta = fabsf(anim.layer6_weight - last_layer6);
-		last_layer6 = anim.layer6_weight;
+		// Layer 6 jitter protection (per-player)
+		const float layer6_delta = fabsf(anim.layer6_weight - anim.prev_layer6_weight);
+		anim.prev_layer6_weight = anim.layer6_weight;
 
 		if (layer6_delta > 0.12f)
 			noise = std::min(noise + 0.14f, 0.55f);
 		else if (layer6_delta > 0.06f)
 			noise = std::min(noise + 0.07f, 0.40f);
+
+		// Layer 12 trust — tighten noise only (no direct bias write)
+		if (anim.layer12_weight > 0.65f && anim.standing_ticks > 15)
+			noise *= 0.80f;
+
+		// Layer 6 locked + strong desync — trust measurement more
+		if (layer6_delta < 0.03f && fabsf(measurement) > 0.65f)
+			noise = std::max(noise * 0.85f, 0.06f);
+
+		// Layer 3 snap — AA likely flipped, loosen filter
+		const float layer3_delta = fabsf(anim.layer3_weight - anim.prev_layer3_weight);
+		anim.prev_layer3_weight = anim.layer3_weight;
+
+		if (layer3_delta > 0.40f && anim.standing_ticks > 6)
+		{
+			k.variance *= 1.5f;
+			k.variance = std::max(k.variance, 0.08f);
+		}
+
+		// Long idle + high layer12 — max confidence window
+		if (anim.standing_ticks > 20 && anim.layer12_weight > 0.70f)
+		{
+			k.variance = std::min(k.variance, 0.12f);
+			noise = std::min(noise, 0.08f);
+		}
+
+		// LBY snap — stronger trust in the new feet direction briefly
+		if (anim.lby_snapped)
+			noise = std::min(noise, 0.12f);
 	}
 	else if (anim.is_moving)
 	{
 		measurement = std::clamp(anim.velocity_yaw_delta / 65.f, -1.f, 1.f);
-		noise = 0.65f;
+
+		// Speed-scaled noise (fixes slow-move hesitation)
+		if (anim.speed_2d < 40.f)
+			noise = 0.35f;
+		else if (anim.speed_2d < 90.f)
+			noise = 0.48f;
+		else
+			noise = 0.58f;
 	}
 	else
 	{
@@ -480,11 +540,9 @@ resolver_direction resolver::bias_to_direction(float bias)
 	static float last_direction_bias = 0.f;  // per-player
 	const float hysteresis = 0.10f;
 
-	if (bias < -0.85f + hysteresis) return resolver_direction::resolver_min_min;
 	if (bias < -0.55f + hysteresis) return resolver_direction::resolver_min_extra;
 	if (bias < -0.32f + hysteresis) return resolver_direction::resolver_min;
 
-	if (bias > 0.85f - hysteresis) return resolver_direction::resolver_max_max;
 	if (bias > 0.55f - hysteresis) return resolver_direction::resolver_max_extra;
 	if (bias > 0.32f - hysteresis) return resolver_direction::resolver_max;
 
@@ -492,12 +550,12 @@ resolver_direction resolver::bias_to_direction(float bias)
 	return resolver_direction::resolver_networked;
 }
 
-void resolver::yaw_resolve( const lag_record_t* record, const lag_record_t* previous )
+void resolver::yaw_resolve(const lag_record_t* record, const lag_record_t* previous)
 {
-	if ( record->m_shot || ( previous && previous->m_shot ) )
+	if (record->m_shot || (previous && previous->m_shot))
 		return;
 
-	auto& log = player_log::get_log( record->m_index );
+	auto& log = player_log::get_log(record->m_index);
 	const auto& anim = log.m_anim;
 
 	// If Kalman is already confident, don't let mode flips fight it
@@ -507,34 +565,39 @@ void resolver::yaw_resolve( const lag_record_t* record, const lag_record_t* prev
 
 	float layer6_delta = 0.f;
 	float feet_delta_change = 0.f;
+	float layer3_delta = 0.f;
 
-	if ( previous )
+	if (previous)
 	{
-		layer6_delta = fabsf( record->m_layers[ 6 ].m_flWeight - previous->m_layers[ 6 ].m_flWeight );
+		layer6_delta = fabsf(record->m_layers[6].m_flWeight - previous->m_layers[6].m_flWeight);
 
-		const float prev_feet = previous->m_state[ resolver_direction::resolver_networked ].m_animstate.foot_yaw;
-		const float prev_eye_feet = math::normalize_float( previous->m_eye_angles.y - prev_feet );
-		feet_delta_change = fabsf( anim.eye_feet_delta - prev_eye_feet );
+		const float prev_feet = previous->m_state[resolver_direction::resolver_networked].m_animstate.foot_yaw;
+		const float prev_eye_feet = math::normalize_float(previous->m_eye_angles.y - prev_feet);
+		feet_delta_change = fabsf(anim.eye_feet_delta - prev_eye_feet);
+
+		// ============ HEURISTIC: Layer 3 Snap = Early Flip Signal ============
+		layer3_delta = fabsf(record->m_layers[3].m_flWeight - previous->m_layers[3].m_flWeight);
 	}
 
 	const bool standing = anim.is_standing && anim.standing_ticks > 1;
-	const bool strong_layer_flip = standing && layer6_delta > 0.55f
-		&& anim.standing_ticks > 6;  // require settled state
+	const bool strong_layer_flip = standing && layer6_delta > 0.55f && anim.standing_ticks > 6;
 	const bool strong_feet_flip = !anim.is_moving && feet_delta_change > 40.f;
-	const bool extreme_desync = fabsf( anim.eye_feet_delta ) > 105.f;
+	const bool extreme_desync = fabsf(anim.eye_feet_delta) > 105.f;
+
+	// ============ HEURISTIC: Layer 3 Snap Predictor ============
+	// Layer 3 snaps *before* layer 6 settles, so catch it early
+	const bool layer3_flip_signal = layer3_delta > 0.40f && standing && anim.standing_ticks > 6;
 
 	const auto previous_mode = log.m_current_mode;
 
-	if ( strong_layer_flip || strong_feet_flip || extreme_desync )
-		log.m_current_mode = static_cast< resolver_mode >( !static_cast< int >( log.m_current_mode ) );
+	if (strong_layer_flip || strong_feet_flip || extreme_desync || layer3_flip_signal)
+	{
+		log.m_current_mode = static_cast<resolver_mode>(!static_cast<int>(log.m_current_mode));
+	}
 
-	if ( previous_mode != log.m_current_mode )
+	if (previous_mode != log.m_current_mode)
 		log.m_last_flip_tick = interfaces::client_state()->get_last_server_tick();
-
-	//if ( interfaces::client_state()->get_last_server_tick() - log.m_last_flip_tick > time_to_ticks( 1.1f ) )
-		//log.m_current_mode = resolver_mode::resolver_default;
 }
-
 
 void resolver::on_createmove()
 {
@@ -570,7 +633,6 @@ void resolver::on_createmove()
 void resolver::wall_detect(lag_record_t* record)
 {
 	auto& log = player_log::get_log(record->m_index);
-
 	const auto player = globals::get_player(record->m_index);
 	if (!player)
 		return;
@@ -582,9 +644,8 @@ void resolver::wall_detect(lag_record_t* record)
 	record->m_did_wall_detect = true;
 
 	// ---------- Lightweight freestand ----------
-	const Vector eye_pos = record->m_origin + Vector(0.f, 0.f, 64.f);	// rough head height
+	const Vector eye_pos = record->m_origin + Vector(0.f, 0.f, 64.f);
 	const Vector target = current_eye;
-
 	const float yaw = math::calc_angle(eye_pos, target).y;
 
 	auto get_rotated = [](Vector start, float rotation, float dist) -> Vector
@@ -598,17 +659,13 @@ void resolver::wall_detect(lag_record_t* record)
 	const Vector local_left = get_rotated(eye_pos, math::normalize_float(yaw - 90.f), 18.f);
 	const Vector local_right = get_rotated(eye_pos, math::normalize_float(yaw + 90.f), 18.f);
 
-	// Simple damage check (you can keep using can_hit / pen_data if you prefer)
 	auto get_damage = [&](const Vector& from, const Vector& to) -> float
 		{
 			aimbot::aimpoint_t point{};
 			point.point = to;
-
 			auto pen = *interfaces::weapon_system()->GetWpnData(WEAPON_AWP);
 			pen.idamage = 200;
-
 			can_hit(player, penetration::pen_data({}, {}, {}, {}, &pen), from, &point, point.damage);
-
 			return point.damage;
 		};
 
@@ -617,7 +674,6 @@ void resolver::wall_detect(lag_record_t* record)
 
 	// Decide side
 	resolver_side new_side = log.m_current_side;
-
 	if (dmg_left > 0.f && dmg_right <= 0.f)
 		new_side = resolver_side::resolver_left;
 	else if (dmg_right > 0.f && dmg_left <= 0.f)
@@ -631,15 +687,31 @@ void resolver::wall_detect(lag_record_t* record)
 	log.m_wall_detect_ang = math::normalize_float(yaw + (new_side == resolver_side::resolver_left ? -90.f : 90.f));
 
 	// ---------- Proactive Kalman measurement ----------
-	// Positive bias = right, negative = left
 	float freestand_meas = 0.f;
-	float noise = 0.55f;		// medium trust
+	float noise = 0.55f;
 
 	if (dmg_left > 0.f || dmg_right > 0.f)
 	{
 		const float total = dmg_left + dmg_right + 1.f;
-		freestand_meas = (dmg_right - dmg_left) / total;	// roughly -1 ... +1
-		noise = 0.35f;		// we have real freestand info → higher trust
+		freestand_meas = (dmg_right - dmg_left) / total;
+		noise = 0.35f;
+
+		// ============ HEURISTIC: Asymmetric damage = strong bias signal ============
+		// If one side is heavily favored, nudge bias hard toward it
+		const float damage_ratio = std::max(dmg_left, dmg_right) / std::max(1.f, std::min(dmg_left, dmg_right));
+
+		if (damage_ratio > 2.5f)  // Strong asymmetry
+		{
+			noise *= 0.75f;  // Increase trust
+			const float strong_nudge = freestand_meas * 0.15f;
+			log.m_kalman.bias += strong_nudge;
+		}
+		else if (damage_ratio > 1.5f)  // Moderate asymmetry
+		{
+			noise *= 0.88f;
+			const float moderate_nudge = freestand_meas * 0.08f;
+			log.m_kalman.bias += moderate_nudge;
+		}
 	}
 
 	update_kalman(log, freestand_meas, noise);
@@ -1096,23 +1168,29 @@ void resolver::get_brute_angle(shot_t* shot)
 	const auto side = shot->record.m_resolver_side;
 	const auto tried_dir = shot->record.m_shot_dir;
 
+	// Biases matched to bias_to_direction thresholds:
+	//   min        < -0.55  (band center ~ -0.66)
+	//   min_extra  < -0.32  (band center ~ -0.43)
+	//   max_extra  >  0.32  (band center ~  0.43)
+	//   max        >  0.55  (band center ~  0.66)
+	// min_min / max_max removed
 	float tried_bias = 0.f;
 	switch (tried_dir)
 	{
-	case resolver_direction::resolver_min_min:   tried_bias = -0.95f; break;
-	case resolver_direction::resolver_min_extra: tried_bias = -0.80f; break;
-	case resolver_direction::resolver_min:       tried_bias = -0.70f; break;
-	case resolver_direction::resolver_max_max:   tried_bias = 0.95f;  break;
-	case resolver_direction::resolver_max_extra: tried_bias = 0.80f;  break;
-	case resolver_direction::resolver_max:       tried_bias = 0.70f;  break;
-	default:                                     tried_bias = 0.f;    break;
+	case resolver_direction::resolver_min:       tried_bias = -0.66f; break;
+	case resolver_direction::resolver_min_extra: tried_bias = -0.43f; break;
+	case resolver_direction::resolver_max:       tried_bias = 0.66f; break;
+	case resolver_direction::resolver_max_extra: tried_bias = 0.43f; break;
+	default:                                     tried_bias = 0.f;   break;
 	}
 
-	// Aimed head, predicted high damage, but server says body → soft resolve miss
 	const bool aimed_head_hit_body =
 		shot->hurt &&
 		shot->hitgroup == HITGROUP_HEAD &&
 		shot->hitinfo.hitgroup != HITGROUP_HEAD;
+
+	const bool was_extrapolated =
+		shot->record.m_extrapolated || shot->record.m_shot_info.extrapolated;
 
 	const bool registered_hit = shot->hurt && !aimed_head_hit_body;
 	const bool registered_miss = (shot->hit && !shot->hurt) || aimed_head_hit_body;
@@ -1132,17 +1210,22 @@ void resolver::get_brute_angle(shot_t* shot)
 		default:                                                 hurt_noise = 0.07f; break;
 		}
 
+		if (was_extrapolated)
+			hurt_noise = std::min(hurt_noise + 0.05f, 0.15f);
+
 		update_kalman(log, tried_bias, hurt_noise);
 	}
 	else if (registered_miss)
 	{
 		if (fabsf(tried_bias) >= 0.05f)
 		{
-			// Mismatch gets slightly higher noise than a pure resolve miss
 			const float commitment = 1.f - std::clamp(log.m_kalman.variance / 0.25f, 0.f, 1.f);
-			const float miss_noise = aimed_head_hit_body
-				? 0.10f - commitment * 0.04f  // 0.06f when confident, 0.10f when uncertain
-				: 0.08f - commitment * 0.02f;  // 0.06f when confident, 0.08f when uncertain
+			float miss_noise = aimed_head_hit_body
+				? 0.10f - commitment * 0.04f
+				: 0.08f - commitment * 0.02f;
+
+			if (was_extrapolated)
+				miss_noise = std::min(miss_noise + 0.08f, 0.40f);
 
 			update_kalman(log, -tried_bias, miss_noise);
 		}
@@ -1151,9 +1234,12 @@ void resolver::get_brute_angle(shot_t* shot)
 	{
 		if (fabsf(tried_bias) >= 0.05f)
 		{
-			// Always learn from no-regs, but scale noise by confidence
 			const float commitment = 1.f - std::clamp(log.m_kalman.variance / 0.25f, 0.f, 1.f);
-			const float noreg_noise = 0.25f - commitment * 0.10f;  // 0.15f when confident
+			float noreg_noise = 0.25f - commitment * 0.10f;
+
+			if (was_extrapolated)
+				noreg_noise = std::min(noreg_noise + 0.10f, 0.45f);
+
 			update_kalman(log, -tried_bias, noreg_noise);
 		}
 	}
@@ -1172,17 +1258,12 @@ void resolver::get_brute_angle(shot_t* shot)
 
 		const float hysteresis = 0.35f;
 
-		// MIN side: clear when bias moves positive
-		if (bl[resolver_direction::resolver_min_min] && bias > -0.85f + hysteresis)
-			bl[resolver_direction::resolver_min_min] = false;
+		// Only the directions bias_to_direction still uses
 		if (bl[resolver_direction::resolver_min_extra] && bias > -0.55f + hysteresis)
 			bl[resolver_direction::resolver_min_extra] = false;
 		if (bl[resolver_direction::resolver_min] && bias > -0.32f + hysteresis)
 			bl[resolver_direction::resolver_min] = false;
 
-		// MAX side: clear when bias moves negative
-		if (bl[resolver_direction::resolver_max_max] && bias < 0.85f - hysteresis)
-			bl[resolver_direction::resolver_max_max] = false;
 		if (bl[resolver_direction::resolver_max_extra] && bias < 0.55f - hysteresis)
 			bl[resolver_direction::resolver_max_extra] = false;
 		if (bl[resolver_direction::resolver_max] && bias < 0.32f - hysteresis)
@@ -1228,8 +1309,6 @@ void resolver::calc_missed_shots(shot_t* shot)
 	{
 		const bool mismatch = shot->hitgroup == HITGROUP_HEAD &&
 			shot->hitinfo.hitgroup != HITGROUP_HEAD;
-
-		interfaces::cvar()->ConsoleColorPrintf(Color(235, 5, 90), xorstr_("[fatality] "));
 
 		if (mismatch)
 		{
