@@ -1,33 +1,33 @@
 #include <random>
 #include "../include_cheat.h"
 
-void resolver::resolve( C_CSPlayer* player, lag_record_t* record, lag_record_t* previous )
+void resolver::resolve(C_CSPlayer* player, lag_record_t* record, lag_record_t* previous)
 {
-	if ( !player->is_enemy() )
+	if (!player->is_enemy())
 		return;
 
-	if ( !record->m_shot )
-		pitch_resolve( record );
+	if (!record->m_shot)
+		pitch_resolve(record);
 
-	auto& log = player_log::get_log(player->EntIndex());   // ← add this
+	auto& log = player_log::get_log(player->EntIndex());
 	update_animation_features(log, record);
 	update_kalman_from_anim(log);
 
-	yaw_resolve( record, previous );
+	yaw_resolve(record, previous);
 }
 
 void resolver::post_animate(C_CSPlayer* player, lag_record_t* record)
 {
 	auto& log = player_log::get_log(player->EntIndex());
 
-	// Keep existing safety against invalid directions
 	if (vars::aim.resolver_mode->get<int>())
 	{
 		for (auto& mode : log.m_mode)
 		{
 			for (auto& side : mode.m_side)
 			{
-				if (side.m_current_dir > resolver_direction::resolver_max)
+				if (side.m_current_dir < resolver_direction::resolver_networked ||
+					side.m_current_dir >= resolver_direction::resolver_direction_max)
 				{
 					side.m_current_dir = resolver_direction::resolver_networked;
 					log.m_unknown_shot = true;
@@ -37,7 +37,6 @@ void resolver::post_animate(C_CSPlayer* player, lag_record_t* record)
 		}
 	}
 
-	// Reset sides for non-enemies / bots
 	if (!player->is_enemy() || player->get_player_info().fakeplayer)
 	{
 		log.m_mode[resolver_mode::resolver_shot].m_side =
@@ -45,11 +44,9 @@ void resolver::post_animate(C_CSPlayer* player, lag_record_t* record)
 			log.m_mode[resolver_mode::resolver_flip].m_side = {};
 	}
 
-	// Store mode/side on the record
 	record->m_resolver_mode = record->m_shot ? resolver_mode::resolver_shot : log.m_current_mode;
 	record->m_resolver_side = log.m_current_side;
 
-	// Pitch tracking
 	if (!record->m_shot)
 	{
 		const auto cureye = record->m_eye_angles;
@@ -59,19 +56,16 @@ void resolver::post_animate(C_CSPlayer* player, lag_record_t* record)
 			log.m_last_zero_pitch = interfaces::globals()->curtime;
 	}
 
-	// Copy direction into shot mode if needed
 	if (log.m_unknown_shot && log.m_mode[log.m_current_mode].m_side[log.m_current_side].m_current_dir > resolver_direction::resolver_networked)
 	{
 		log.m_mode[resolver_mode::resolver_shot].m_side[log.m_current_side].m_current_dir =
 			log.m_mode[log.m_current_mode].m_side[log.m_current_side].m_current_dir;
 	}
 
-	// ---------- Apply Kalman direction ----------
 	if (!record->m_shot && player->is_enemy() && !player->get_player_info().fakeplayer)
 	{
 		const auto mode_to_write = record->m_resolver_mode;
 
-		// First-shot assist: if still uncertain, gently pull toward freestand side
 		if (log.m_kalman.variance > 0.35f)
 		{
 			if (log.m_current_side == resolver_side::resolver_left)
@@ -80,7 +74,6 @@ void resolver::post_animate(C_CSPlayer* player, lag_record_t* record)
 				update_kalman(log, 0.35f, 0.55f);
 		}
 
-		// Extrapolated pose — reduce confidence so we don't shoot a stale locked angle
 		if (record->m_extrapolated)
 		{
 			const float extra = record->m_extrapolate_amt > 0
@@ -129,9 +122,7 @@ bool resolver::extrapolate_record(int ticks, lag_record_t& outrecord, const bool
 
 	auto& log = player_log::get_log(outrecord.m_index);
 
-	// ========================================================================
-	// SIMPLE PATH (higher quality movement prediction)
-	// ========================================================================
+	//simple (misleading)
 	if (simple)
 	{
 		process_move_changes_t backup_pm{};
@@ -141,7 +132,6 @@ bool resolver::extrapolate_record(int ticks, lag_record_t& outrecord, const bool
 		const lag_record_t* p1 = log.record.size() > 1 ? &log.record[log.record.size() - 2] : nullptr;
 		const lag_record_t* p2 = log.record.size() > 2 ? &log.record[log.record.size() - 3] : nullptr;
 
-		// Improved velocity trend
 		Vector predicted_vel_change{};
 		if (p1 && p2)
 		{
@@ -154,7 +144,6 @@ bool resolver::extrapolate_record(int ticks, lag_record_t& outrecord, const bool
 			predicted_vel_change = (original_record.m_calculated_velocity - p1->m_calculated_velocity) / std::max(1, original_record.m_lagamt);
 		}
 
-		// Clamp insane acceleration
 		if (predicted_vel_change.Length2D() > 35.f)
 			predicted_vel_change = predicted_vel_change.Normalized() * 35.f;
 
@@ -175,7 +164,6 @@ bool resolver::extrapolate_record(int ticks, lag_record_t& outrecord, const bool
 			cmd.forwardmove = speed > 5.f ? 450.f : (i % 2 ? 1.01f : -1.01f);
 			cmd.sidemove = 0.f;
 
-			// Ducking
 			if (original_record.m_duckamt > 0.f)
 				cmd.buttons |= IN_DUCK;
 			else
@@ -193,7 +181,6 @@ bool resolver::extrapolate_record(int ticks, lag_record_t& outrecord, const bool
 					prev_buttons |= IN_JUMP;
 			}
 
-			// Air strafe correction
 			if (!(player->get_flags() & FL_ONGROUND))
 			{
 				QAngle vel_ang;
@@ -206,7 +193,7 @@ bool resolver::extrapolate_record(int ticks, lag_record_t& outrecord, const bool
 					cmd.sidemove = delta > 0.f ? 450.f : -450.f;
 				}
 			}
-			// Ground speed control
+
 			else if (p1)
 			{
 				const float prev_speed = p1->m_velocity.Length2D();
@@ -228,14 +215,12 @@ bool resolver::extrapolate_record(int ticks, lag_record_t& outrecord, const bool
 				}
 			}
 
-			// Simulate one tick
 			CMoveData data = interfaces::game_movement()->setup_move(player, &cmd);
 			data.m_nOldButtons = prev_buttons;
 			const auto ret = interfaces::game_movement()->process_movement(player, &data);
 			prev_buttons = data.m_nButtons;
 			ret.restore(player);
 
-			// Jump handling
 			if (p1)
 			{
 				if (!(p1->m_flags & FL_ONGROUND) && !(original_record.m_flags & FL_ONGROUND) && (player->get_flags() & FL_ONGROUND))
@@ -262,10 +247,8 @@ bool resolver::extrapolate_record(int ticks, lag_record_t& outrecord, const bool
 
 		return true;
 	}
-
-	// ========================================================================
-	// NON-SIMPLE PATH (animation update)
-	// ========================================================================
+	
+	//real simple
 	new_previous->m_velocity = outrecord.m_calculated_velocity;
 	outrecord.m_simtime += interfaces::globals()->interval_per_tick * ticks;
 	outrecord.m_lagamt = ticks;
@@ -288,13 +271,13 @@ bool resolver::extrapolate_record(int ticks, lag_record_t& outrecord, const bool
 	return true;
 }
 
-void resolver::pitch_resolve( lag_record_t* record )
+void resolver::pitch_resolve(lag_record_t* record)
 {
-	const auto& log = player_log::get_log( record->m_index );
+	const auto& log = player_log::get_log(record->m_index);
 
-	if ( globals::nospread )
+	if (globals::nospread)
 	{
-		if ( log.nospread.m_pitch_cycle % 2 && log.nospread.m_can_fake )
+		if (log.nospread.m_pitch_cycle % 2 && log.nospread.m_can_fake)
 		{
 			record->m_eye_angles.x = -record->m_eye_angles.x;
 		}
@@ -304,16 +287,16 @@ void resolver::pitch_resolve( lag_record_t* record )
 }
 
 
-float resolver::get_resolver_angle( const lag_record_t& record, resolver_direction direction, float eye_angle )
+float resolver::get_resolver_angle(const lag_record_t& record, resolver_direction direction, float eye_angle)
 {
-	switch ( direction )
+	switch (direction)
 	{
-		case resolver_direction::resolver_max:
-			return math::normalize_float( eye_angle + record.m_state[ direction ].m_animstate.aim_yaw_max * record.m_yaw_modifier * 2.f );
-		case resolver_direction::resolver_min:
-			return math::normalize_float( eye_angle + record.m_state[ direction ].m_animstate.aim_yaw_min * record.m_yaw_modifier * 2.f );
-		default:
-			return eye_angle;
+	case resolver_direction::resolver_max:
+		return math::normalize_float(eye_angle + record.m_state[direction].m_animstate.aim_yaw_max * record.m_yaw_modifier * 2.f);
+	case resolver_direction::resolver_min:
+		return math::normalize_float(eye_angle + record.m_state[direction].m_animstate.aim_yaw_min * record.m_yaw_modifier * 2.f);
+	default:
+		return eye_angle;
 	}
 }
 
@@ -537,7 +520,6 @@ void resolver::update_kalman_from_anim(player_log_t& log)
 
 resolver_direction resolver::bias_to_direction(float bias)
 {
-	static float last_direction_bias = 0.f;  // per-player
 	const float hysteresis = 0.10f;
 
 	if (bias < -0.55f + hysteresis) return resolver_direction::resolver_min_extra;
@@ -601,7 +583,7 @@ void resolver::yaw_resolve(const lag_record_t* record, const lag_record_t* previ
 
 void resolver::on_createmove()
 {
-	if ( tickbase::force_choke )
+	if (tickbase::force_choke)
 		return;
 
 	std::vector<std::shared_ptr<detail::call_queue::queue_element>> calls;
@@ -610,21 +592,21 @@ void resolver::on_createmove()
 	static Vector last_eyepos = {};
 	const auto eyepos = local_player->get_eye_pos();
 
-	for ( const auto player : interfaces::entity_list()->get_players() )
+	for (const auto player : interfaces::entity_list()->get_players())
 	{
-		auto& log = player_log::get_log( player->EntIndex() );
-		if ( player->IsDormant() || !player->is_enemy() || log.record.empty() || player->get_player_info().fakeplayer || !log.is_hittable )
+		auto& log = player_log::get_log(player->EntIndex());
+		if (player->IsDormant() || !player->is_enemy() || log.record.empty() || player->get_player_info().fakeplayer || !log.is_hittable)
 			continue;
 
 		auto& newest = log.record.back();
 
-		if ( fabsf( eyepos.Length() - last_eyepos.Length() ) > 2.f )
+		if (fabsf(eyepos.Length() - last_eyepos.Length()) > 2.f)
 			newest.m_did_wall_detect = false;
 
-		if ( newest.m_did_wall_detect )
+		if (newest.m_did_wall_detect)
 			continue;
 
-		wall_detect( &newest );
+		wall_detect(&newest);
 	}
 
 	last_eyepos = eyepos;
@@ -717,23 +699,23 @@ void resolver::wall_detect(lag_record_t* record)
 	update_kalman(log, freestand_meas, noise);
 }
 
-void resolver::add_shot( shot_t& shot )
+void resolver::add_shot(shot_t& shot)
 {
-	shots.emplace_back( shot );
+	shots.emplace_back(shot);
 }
 
-void resolver::update_missed_shots( const ClientFrameStage_t& stage )
+void resolver::update_missed_shots(const ClientFrameStage_t& stage)
 {
-	if ( stage != FRAME_NET_UPDATE_END )
+	if (stage != FRAME_NET_UPDATE_END)
 		return;
 
 	auto it = shots.begin();
-	while ( it != shots.end() )
+	while (it != shots.end())
 	{
 		const auto shot = *it;
-		if ( shot.tick + time_to_ticks( 1.f ) < interfaces::globals()->tickcount || shot.tick - 10 > interfaces::globals()->tickcount )
+		if (shot.tick + time_to_ticks(1.f) < interfaces::globals()->tickcount || shot.tick - 10 > interfaces::globals()->tickcount)
 		{
-			it = shots.erase( it );
+			it = shots.erase(it);
 		}
 		else
 		{
@@ -742,12 +724,12 @@ void resolver::update_missed_shots( const ClientFrameStage_t& stage )
 	}
 
 	auto it2 = current_shots.begin();
-	while ( it2 != current_shots.end() )
+	while (it2 != current_shots.end())
 	{
 		const auto shot = *it2;
-		if ( shot.tick + time_to_ticks( 1.f ) < interfaces::globals()->tickcount || shot.tick - 10 > interfaces::globals()->tickcount )
+		if (shot.tick + time_to_ticks(1.f) < interfaces::globals()->tickcount || shot.tick - 10 > interfaces::globals()->tickcount)
 		{
-			it2 = current_shots.erase( it2 );
+			it2 = current_shots.erase(it2);
 		}
 		else
 		{
@@ -756,29 +738,29 @@ void resolver::update_missed_shots( const ClientFrameStage_t& stage )
 	}
 }
 
-void resolver::hurt_listener( IGameEvent* game_event, record_shot_info_t& shot_info )
+void resolver::hurt_listener(IGameEvent* game_event, record_shot_info_t& shot_info)
 {
-	const auto attacker = interfaces::engine()->GetPlayerForUserID( game_event->GetInt( "attacker" ) );
-	const auto victim = interfaces::engine()->GetPlayerForUserID( game_event->GetInt( "userid"  ) );
-	const auto hitgroup = game_event->GetInt( "hitgroup" );
-	const auto damage = game_event->GetInt( "dmg_health" );
+	const auto attacker = interfaces::engine()->GetPlayerForUserID(game_event->GetInt("attacker"));
+	const auto victim = interfaces::engine()->GetPlayerForUserID(game_event->GetInt("userid"));
+	const auto hitgroup = game_event->GetInt("hitgroup");
+	const auto damage = game_event->GetInt("dmg_health");
 
-	if ( attacker != interfaces::engine()->GetLocalPlayer() )
+	if (attacker != interfaces::engine()->GetLocalPlayer())
 		return;
 
-	if ( victim == interfaces::engine()->GetLocalPlayer() )
+	if (victim == interfaces::engine()->GetLocalPlayer())
 		return;
 
-	const auto player = globals::get_player( victim );
-	if ( !player || !player->is_enemy() )
+	const auto player = globals::get_player(victim);
+	if (!player || !player->is_enemy())
 		return;
 
-	if ( unapproved_shots.empty() )
+	if (unapproved_shots.empty())
 		return;
 
-	for ( auto& shot : unapproved_shots )
+	for (auto& shot : unapproved_shots)
 	{
-		if ( !shot.hurt && shot.enemy_index == victim )
+		if (!shot.hurt && shot.enemy_index == victim)
 		{
 			shot.hurt = true;
 			shot.hitinfo.victim = victim;
@@ -790,10 +772,10 @@ void resolver::hurt_listener( IGameEvent* game_event, record_shot_info_t& shot_i
 	}
 }
 
-resolver::shot_t* resolver::closest_shot( int tickcount )
+resolver::shot_t* resolver::closest_shot(int tickcount)
 {
 	shot_t* closest_shot = nullptr;
-	for ( auto& shot : shots )
+	for (auto& shot : shots)
 	{
 		closest_shot = &shot;
 		break;
@@ -802,52 +784,52 @@ resolver::shot_t* resolver::closest_shot( int tickcount )
 	return closest_shot;
 }
 
-bool resolver::record_shot( IGameEvent* game_event )
+bool resolver::record_shot(IGameEvent* game_event)
 {
-	const auto userid = interfaces::engine()->GetPlayerForUserID( game_event->GetInt( "userid" ) );
-	const auto player = globals::get_player( userid );
+	const auto userid = interfaces::engine()->GetPlayerForUserID(game_event->GetInt("userid"));
+	const auto player = globals::get_player(userid);
 
-	if ( player != local_player )
+	if (player != local_player)
 		return false;
 
-	const auto shot = closest_shot( interfaces::globals()->tickcount - time_to_ticks( interfaces::engine()->GetNetChannelInfo()->GetLatency( FLOW_OUTGOING ) ) );
-	if ( !shot )
+	const auto shot = closest_shot(interfaces::globals()->tickcount - time_to_ticks(interfaces::engine()->GetNetChannelInfo()->GetLatency(FLOW_OUTGOING)));
+	if (!shot)
 		return false;
 
-	current_shots.push_front( *shot );
+	current_shots.push_front(*shot);
 	shots.pop_front();
 	current_hitposes.clear();
 
 	return true;
 }
 
-void resolver::listener( IGameEvent* game_event )
+void resolver::listener(IGameEvent* game_event)
 {
 	static auto last_tickcount = 0;
 
-	if ( !strcmp( game_event->GetName(), "weapon_fire" ) )
+	if (!strcmp(game_event->GetName(), "weapon_fire"))
 	{
-		if ( record_shot( game_event ) )
+		if (record_shot(game_event))
 			last_tickcount = 0;
 		return;
 	}
 
-	if ( current_shots.empty() )
+	if (current_shots.empty())
 		return;
 
-	const auto userid = interfaces::engine()->GetPlayerForUserID( game_event->GetInt( "userid"  ) );
-	const auto player = globals::get_player( userid );
+	const auto userid = interfaces::engine()->GetPlayerForUserID(game_event->GetInt("userid"));
+	const auto player = globals::get_player(userid);
 
-	if ( !player || player != local_player )
+	if (!player || player != local_player)
 		return;
 
-	const Vector pos( game_event->GetFloat( "x" ), game_event->GetFloat( "y" ), game_event->GetFloat( "z" ) );
+	const Vector pos(game_event->GetFloat("x"), game_event->GetFloat("y"), game_event->GetFloat("z"));
 
-	const auto shot = &current_shots[ 0 ];
+	const auto shot = &current_shots[0];
 
 	static auto counter = 0;
 
-	if ( last_tickcount == interfaces::globals()->tickcount )
+	if (last_tickcount == interfaces::globals()->tickcount)
 		counter++;
 	else
 	{
@@ -855,24 +837,24 @@ void resolver::listener( IGameEvent* game_event )
 		counter = 0;
 	}
 
-	if ( counter )
+	if (counter)
 		unapproved_shots.pop_front();
 
-	current_hitposes.push_back( pos );
+	current_hitposes.push_back(pos);
 	shot->hitposes = current_hitposes;
-	unapproved_shots.emplace_back( *shot );
+	unapproved_shots.emplace_back(*shot);
 
 	last_tickcount = interfaces::globals()->tickcount;
 }
 
-Vector resolver::get_closest_hitpos( const shot_t& shot, const Vector& pos )
+Vector resolver::get_closest_hitpos(const shot_t& shot, const Vector& pos)
 {
 	Vector closest = {};
 	auto last_dist = FLT_MAX;
-	for ( auto& hitpos : shot.hitposes )
+	for (auto& hitpos : shot.hitposes)
 	{
-		const auto dist = hitpos.Dist( pos );
-		if ( dist < last_dist )
+		const auto dist = hitpos.Dist(pos);
+		if (dist < last_dist)
 		{
 			last_dist = dist;
 			closest = hitpos;
@@ -882,14 +864,14 @@ Vector resolver::get_closest_hitpos( const shot_t& shot, const Vector& pos )
 	return closest;
 }
 
-Vector resolver::get_closest_penetrationpos( const shot_t& shot, const Vector& pos )
+Vector resolver::get_closest_penetrationpos(const shot_t& shot, const Vector& pos)
 {
 	Vector closest = {};
 	auto last_dist = FLT_MAX;
-	for ( auto& hitpos : shot.penetration_points )
+	for (auto& hitpos : shot.penetration_points)
 	{
-		const auto dist = hitpos.Dist( pos );
-		if ( dist < last_dist )
+		const auto dist = hitpos.Dist(pos);
+		if (dist < last_dist)
 		{
 			last_dist = dist;
 			closest = hitpos;
@@ -899,146 +881,146 @@ Vector resolver::get_closest_penetrationpos( const shot_t& shot, const Vector& p
 	return closest;
 }
 
-void resolver::approve_shots( const ClientFrameStage_t& stage )
+void resolver::approve_shots(const ClientFrameStage_t& stage)
 {
-	if ( stage != FRAME_NET_UPDATE_END )
+	if (stage != FRAME_NET_UPDATE_END)
 		return;
 
-	for ( auto& shot : unapproved_shots )
+	for (auto& shot : unapproved_shots)
 	{
-		if ( shot.hitposes.empty() )
+		if (shot.hitposes.empty())
 			continue;
 
-		auto end = shot.hitposes[ shot.hitposes.size() - 1 ];
+		auto end = shot.hitposes[shot.hitposes.size() - 1];
 
-		if ( vars::misc.impacts->get<bool>() )
+		if (vars::misc.impacts->get<bool>())
 		{
-			auto col2 = Color( vars::misc.impacts_color2->get<D3DCOLOR>() );
+			auto col2 = Color(vars::misc.impacts_color2->get<D3DCOLOR>());
 
-			for ( auto& point : shot.hitposes )
-				interfaces::debug_overlay()->AddBoxOverlay( point, Vector( -1.25f, -1.25f, -1.25f ), Vector( 1.25f, 1.25f, 1.25f ), QAngle( 0, 0, 0 ), col2.r(), col2.g(), col2.b(), 180, 4 );
+			for (auto& point : shot.hitposes)
+				interfaces::debug_overlay()->AddBoxOverlay(point, Vector(-1.25f, -1.25f, -1.25f), Vector(1.25f, 1.25f, 1.25f), QAngle(0, 0, 0), col2.r(), col2.g(), col2.b(), 180, 4);
 		}
 
-		if ( local_player && local_player->get_alive() && prediction::get_pred_info( shot.cmdnum ).sequence == shot.cmdnum )
+		if (local_player && local_player->get_alive() && prediction::get_pred_info(shot.cmdnum).sequence == shot.cmdnum)
 		{
-			auto new_origin = prediction::get_pred_info( shot.cmdnum ).origin;
+			auto new_origin = prediction::get_pred_info(shot.cmdnum).origin;
 			shot.shotpos.x = new_origin.x;
 			shot.shotpos.y = new_origin.y;
 		}
 
-		const auto angles = math::calc_angle( shot.shotpos, end );
+		const auto angles = math::calc_angle(shot.shotpos, end);
 		Vector direction{};
-		math::angle_vectors( angles, &direction );
+		math::angle_vectors(angles, &direction);
 
-		if ( shot.record.m_index == -1 )
+		if (shot.record.m_index == -1)
 		{
-			if ( shot.hurt )
+			if (shot.hurt)
 			{
-				if ( shot.penetration_points.empty() )
+				if (shot.penetration_points.empty())
 					continue;
 
-				shot.hitpos = get_closest_hitpos( shot, shot.penetration_points[ shot.penetration_points.size() - 1 ] );
+				shot.hitpos = get_closest_hitpos(shot, shot.penetration_points[shot.penetration_points.size() - 1]);
 			}
 
 			Vector zerovec = {};
-			lua::api.callback( FNV1A( "on_shot_registered" ), [&] ( lua::state& state )
-			{
-				state.create_table();
-				state.set_field( XOR_STR( "manual" ), true );
-				state.set_field( XOR_STR( "secure" ), false );
-				state.set_field( XOR_STR( "very_secure" ), false );
-				state.set_field( XOR_STR( "result" ), shot.hurt ? XOR_STR( "hit" ) : XOR_STR( "miss" ) );
-				state.set_field( XOR_STR( "target" ), -1 );
-				state.set_field( XOR_STR( "tick" ), shot.tick );
-				state.set_field( XOR_STR( "backtrack" ), 0 );
-				state.set_field( XOR_STR( "hitchance" ), -1 );
-				state.set_field( XOR_STR( "client_hitgroup" ), -1 );
-				state.set_field( XOR_STR( "client_damage" ), -1 );
-				state.set_field( XOR_STR( "server_hitgroup" ), shot.hitinfo.hitgroup );
-				state.set_field( XOR_STR( "server_damage" ), shot.hitinfo.damage );
-				state.create_user_object<decltype( shot.shotpos )>( XOR_STR( "vec3" ), &shot.shotpos );
-				state.set_field( XOR_STR( "shotpos" ) );
-				state.create_user_object<decltype( zerovec )>( XOR_STR( "vec3" ), &zerovec );
-				state.set_field( XOR_STR( "client_hitpos" ) );
-				state.create_user_object<decltype( shot.hitpos )>( XOR_STR( "vec3" ), shot.hurt ? &shot.hitpos : &zerovec );
-				state.set_field( XOR_STR( "server_hitpos" ) );
-				state.create_table();
+			lua::api.callback(FNV1A("on_shot_registered"), [&](lua::state& state)
 				{
-					auto index = 1;
-					for ( auto cur : shot.penetration_points )
+					state.create_table();
+					state.set_field(XOR_STR("manual"), true);
+					state.set_field(XOR_STR("secure"), false);
+					state.set_field(XOR_STR("very_secure"), false);
+					state.set_field(XOR_STR("result"), shot.hurt ? XOR_STR("hit") : XOR_STR("miss"));
+					state.set_field(XOR_STR("target"), -1);
+					state.set_field(XOR_STR("tick"), shot.tick);
+					state.set_field(XOR_STR("backtrack"), 0);
+					state.set_field(XOR_STR("hitchance"), -1);
+					state.set_field(XOR_STR("client_hitgroup"), -1);
+					state.set_field(XOR_STR("client_damage"), -1);
+					state.set_field(XOR_STR("server_hitgroup"), shot.hitinfo.hitgroup);
+					state.set_field(XOR_STR("server_damage"), shot.hitinfo.damage);
+					state.create_user_object<decltype(shot.shotpos)>(XOR_STR("vec3"), &shot.shotpos);
+					state.set_field(XOR_STR("shotpos"));
+					state.create_user_object<decltype(zerovec)>(XOR_STR("vec3"), &zerovec);
+					state.set_field(XOR_STR("client_hitpos"));
+					state.create_user_object<decltype(shot.hitpos)>(XOR_STR("vec3"), shot.hurt ? &shot.hitpos : &zerovec);
+					state.set_field(XOR_STR("server_hitpos"));
+					state.create_table();
 					{
-						state.create_user_object<decltype( cur )>( XOR_STR( "vec3" ), &cur );
-						state.set_i( index++ );
+						auto index = 1;
+						for (auto cur : shot.penetration_points)
+						{
+							state.create_user_object<decltype(cur)>(XOR_STR("vec3"), &cur);
+							state.set_i(index++);
+						}
 					}
-				}
-				state.set_field( XOR_STR( "client_impacts" ) );
-				state.create_table();
-				{
-					auto index = 1;
-					for ( auto cur : shot.hitposes )
+					state.set_field(XOR_STR("client_impacts"));
+					state.create_table();
 					{
-						state.create_user_object<decltype( cur )>( XOR_STR( "vec3" ), &cur );
-						state.set_i( index++ );
+						auto index = 1;
+						for (auto cur : shot.hitposes)
+						{
+							state.create_user_object<decltype(cur)>(XOR_STR("vec3"), &cur);
+							state.set_i(index++);
+						}
 					}
-				}
-				state.set_field( XOR_STR( "server_impacts" ) );
-				return 1;
-			} );
+					state.set_field(XOR_STR("server_impacts"));
+					return 1;
+				});
 
-			if ( shot.hurt )
+			if (shot.hurt)
 			{
-				const auto player = globals::get_player( shot.hitinfo.victim );
-				if ( player )
+				const auto player = globals::get_player(shot.hitinfo.victim);
+				if (player)
 				{
-					add_hit( hitmarker::hitmarker_t( interfaces::globals()->realtime, shot.hitinfo.victim, shot.hitinfo.damage, shot.hitinfo.hitgroup, shot.hitpos ) );
+					add_hit(hitmarker::hitmarker_t(interfaces::globals()->realtime, shot.hitinfo.victim, shot.hitinfo.damage, shot.hitinfo.hitgroup, shot.hitpos));
 
-					if ( vars::visuals.beams.local.enabled->get<bool>() && vars::visuals.beams.enabled->get<bool>() )
-						add_local_beam( beams::impact_info_t( interfaces::globals()->curtime, shot.shotpos, end, interfaces::engine()->GetLocalPlayer(), Color( vars::visuals.beams.local.color->get<D3DCOLOR>() ) ) );
+					if (vars::visuals.beams.local.enabled->get<bool>() && vars::visuals.beams.enabled->get<bool>())
+						add_local_beam(beams::impact_info_t(interfaces::globals()->curtime, shot.shotpos, end, interfaces::engine()->GetLocalPlayer(), Color(vars::visuals.beams.local.color->get<D3DCOLOR>())));
 					continue;
 				}
 			}
 
-			if ( vars::visuals.beams.local.enabled->get<bool>() && vars::visuals.beams.enabled->get<bool>() )
-				add_local_beam( beams::impact_info_t( interfaces::globals()->curtime, shot.shotpos, end, interfaces::engine()->GetLocalPlayer(), Color( vars::visuals.beams.local.color->get<D3DCOLOR>() ) ) );
+			if (vars::visuals.beams.local.enabled->get<bool>() && vars::visuals.beams.enabled->get<bool>())
+				add_local_beam(beams::impact_info_t(interfaces::globals()->curtime, shot.shotpos, end, interfaces::engine()->GetLocalPlayer(), Color(vars::visuals.beams.local.color->get<D3DCOLOR>())));
 			continue;
 		}
 
-		auto hitpos = get_closest_hitpos( shot, shot.hitgroup != -1 ? shot.hitpos : shot.record.m_origin );
+		auto hitpos = get_closest_hitpos(shot, shot.hitgroup != -1 ? shot.hitpos : shot.record.m_origin);
 
-		auto player = globals::get_player( shot.enemy_index );
-		if ( vars::visuals.chams.enemy.shot_record.type->get<int>() && player )
-			chams::add_ghost( player, &shot.record );
+		auto player = globals::get_player(shot.enemy_index);
+		if (vars::visuals.chams.enemy.shot_record.type->get<int>() && player)
+			chams::add_ghost(player, &shot.record);
 
-		if ( !player )
+		if (!player)
 		{
 			// maybe add shot info
 
 			shot.hitpos = hitpos;
-			if ( shot.hurt )
+			if (shot.hurt)
 			{
-				add_hit( hitmarker::hitmarker_t( interfaces::globals()->realtime, shot.hitinfo.victim, shot.hitinfo.damage, shot.hitinfo.hitgroup, hitpos ) );
+				add_hit(hitmarker::hitmarker_t(interfaces::globals()->realtime, shot.hitinfo.victim, shot.hitinfo.damage, shot.hitinfo.hitgroup, hitpos));
 
-				if ( vars::visuals.beams.local.enabled->get<bool>() && vars::visuals.beams.enabled->get<bool>() && !beams::beam_exists( local_player, interfaces::globals()->curtime ) )
-					add_local_beam( beams::impact_info_t( interfaces::globals()->curtime, shot.shotpos, end, interfaces::engine()->GetLocalPlayer(), Color( vars::visuals.beams.local.color->get<D3DCOLOR>() ) ) );
+				if (vars::visuals.beams.local.enabled->get<bool>() && vars::visuals.beams.enabled->get<bool>() && !beams::beam_exists(local_player, interfaces::globals()->curtime))
+					add_local_beam(beams::impact_info_t(interfaces::globals()->curtime, shot.shotpos, end, interfaces::engine()->GetLocalPlayer(), Color(vars::visuals.beams.local.color->get<D3DCOLOR>())));
 			}
-			else if ( vars::visuals.beams.local.enabled->get<bool>() && vars::visuals.beams.enabled->get<bool>() )
-				add_local_beam( beams::impact_info_t( interfaces::globals()->curtime, shot.shotpos, end, interfaces::engine()->GetLocalPlayer(), Color( vars::visuals.beams.local.color->get<D3DCOLOR>() ) ) );
+			else if (vars::visuals.beams.local.enabled->get<bool>() && vars::visuals.beams.enabled->get<bool>())
+				add_local_beam(beams::impact_info_t(interfaces::globals()->curtime, shot.shotpos, end, interfaces::engine()->GetLocalPlayer(), Color(vars::visuals.beams.local.color->get<D3DCOLOR>())));
 
 			continue;
 		}
 
-		if ( !local_player || !local_player->get_alive() || !local_weapon )
+		if (!local_player || !local_player->get_alive() || !local_weapon)
 			continue;
 
-		shot.hitpos = shot.hitposes[ shot.hitposes.size() - 1 ] + direction * 1000.f;
+		shot.hitpos = shot.hitposes[shot.hitposes.size() - 1] + direction * 1000.f;
 
-		auto& log = player_log::get_log( shot.enemy_index );
-		auto data = penetration::pen_data( &shot.record, shot.record.m_shot_dir, false, nullptr, &shot.weapon_data );
+		auto& log = player_log::get_log(shot.enemy_index);
+		auto data = penetration::pen_data(&shot.record, shot.record.m_shot_dir, false, nullptr, &shot.weapon_data);
 
-		if ( shot.record.m_shot_info.extrapolated && !log.record.empty() && !log.record.back().m_dormant )
+		if (shot.record.m_shot_info.extrapolated && !log.record.empty() && !log.record.back().m_dormant)
 		{
 			//aimbot_helpers::draw_debug_hitboxes( player, log.record.back().matrix( shot.record.m_shot_state ), -1, 5.f, Color( 0, 255, 255, 255 ) );
-			data = penetration::pen_data( &log.record.back(), shot.record.m_shot_dir, false, nullptr, &shot.weapon_data );
+			data = penetration::pen_data(&log.record.back(), shot.record.m_shot_dir, false, nullptr, &shot.weapon_data);
 		}
 
 		aimbot::aimpoint_t aimpoint;
@@ -1047,105 +1029,107 @@ void resolver::approve_shots( const ClientFrameStage_t& stage )
 
 		auto damage = 0;
 		auto new_data = data;
-		if ( can_hit( local_player, new_data, shot.shotpos, &aimpoint, damage, true ) )
+		if (can_hit(local_player, new_data, shot.shotpos, &aimpoint, damage, true))
 		{
-			hitpos = get_closest_hitpos( shot, aimpoint.point );
+			hitpos = get_closest_hitpos(shot, aimpoint.point);
 			shot.hitpos = hitpos;
 			shot.hit = true;
 			shot.hit_originally = true;
 		}
 
-		const auto deltavec = Vector( shot.original_shotpos.x - shot.shotpos.x, shot.original_shotpos.y - shot.shotpos.y, 0 );
-		const auto corrected_pos = fabsf( deltavec.x ) >= 0.001f || fabsf( deltavec.y ) >= 0.001f;
+		const auto deltavec = Vector(shot.original_shotpos.x - shot.shotpos.x, shot.original_shotpos.y - shot.shotpos.y, 0);
+		const auto corrected_pos = fabsf(deltavec.x) >= 0.001f || fabsf(deltavec.y) >= 0.001f;
 
-		if ( corrected_pos )
+		if (corrected_pos)
 		{
 			auto damage2 = 0;
-			shot.hit_originally = can_hit( local_player, data, shot.original_shotpos, &aimpoint, damage2, true );
+			shot.hit_originally = can_hit(local_player, data, shot.original_shotpos, &aimpoint, damage2, true);
 		}
 
-		if ( shot.record.m_shot_info.extrapolated )
+		if (shot.record.m_shot_info.extrapolated)
 		{
 			//aimbot_helpers::draw_debug_hitboxes( player, shot.record.matrix( shot.record.m_shot_state ), -1, 5.f, Color( 255, 255, 255, 255 ) );
 
 			auto damage2 = 0;
-			shot.hit_extrapolation = can_hit( local_player, penetration::pen_data( &shot.record, shot.record.m_shot_dir, false, nullptr, &shot.weapon_data ), shot.shotpos, &aimpoint, damage2, true );
+			shot.hit_extrapolation = can_hit(local_player, penetration::pen_data(&shot.record, shot.record.m_shot_dir, false, nullptr, &shot.weapon_data), shot.shotpos, &aimpoint, damage2, true);
 		}
 
-		if ( vars::visuals.beams.local.enabled->get<bool>() && vars::visuals.beams.enabled->get<bool>() )
-			add_local_beam( beams::impact_info_t( interfaces::globals()->curtime, shot.shotpos, end, interfaces::engine()->GetLocalPlayer(), Color( vars::visuals.beams.local.color->get<D3DCOLOR>() ) ) );
+		if (vars::visuals.beams.local.enabled->get<bool>() && vars::visuals.beams.enabled->get<bool>())
+			add_local_beam(beams::impact_info_t(interfaces::globals()->curtime, shot.shotpos, end, interfaces::engine()->GetLocalPlayer(), Color(vars::visuals.beams.local.color->get<D3DCOLOR>())));
 
-		if ( shot.hurt )
-			add_hit( hitmarker::hitmarker_t( interfaces::globals()->realtime, shot.hitinfo.victim, shot.hitinfo.damage, shot.hitinfo.hitgroup, hitpos ) );
+		if (shot.hurt)
+			add_hit(hitmarker::hitmarker_t(interfaces::globals()->realtime, shot.hitinfo.victim, shot.hitinfo.damage, shot.hitinfo.hitgroup, hitpos));
 
-		if ( shot.hitgroup == -1 )
+		if (shot.hitgroup == -1)
 			continue;
 
 		Vector zerovec = {};
 
-		lua::api.callback( FNV1A( "on_shot_registered" ), [&] ( lua::state& state )
-		{
-			state.create_table();
-			state.set_field( XOR_STR( "manual" ), shot.hitgroup == -1 );
-			state.set_field( XOR_STR( "secure" ), shot.safety >= penetration::safety_no_roll );
-			state.set_field( XOR_STR( "very_secure" ), shot.safety >= penetration::safety_full );
-			state.set_field( XOR_STR( "result" ), shot.hurt ? XOR_STR( "hit" ) : shot.hit ? XOR_STR( "resolve" ) : shot.hit_extrapolation ? ( !ConVar::cl_lagcompensation || !ConVar::cl_predict ) ? XOR_STR( "anti-exploit" ) : XOR_STR( "extrapolation" ) : shot.hit_originally ? XOR_STR( "server correction" ) : XOR_STR( "spread" ) );
-			state.set_field( XOR_STR( "target" ), shot.enemy_index );
-			state.set_field( XOR_STR( "tick" ), shot.tick );
-			state.set_field( XOR_STR( "backtrack" ), shot.record.m_shot_info.backtrack_ticks );
-			state.set_field( XOR_STR( "hitchance" ), shot.record.m_shot_info.hitchance );
-			state.set_field( XOR_STR( "client_hitgroup" ), shot.hitgroup );
-			state.set_field( XOR_STR( "client_damage" ), shot.damage );
-			state.set_field( XOR_STR( "server_hitgroup" ), shot.hitinfo.hitgroup );
-			state.set_field( XOR_STR( "server_damage" ), shot.hitinfo.damage );
-			state.create_user_object<decltype( shot.shotpos )>( XOR_STR( "vec3" ), &shot.shotpos );
-			state.set_field( XOR_STR( "shotpos" ) );
-			state.create_user_object<decltype( end )>( XOR_STR( "vec3" ), &end );
-			state.set_field( XOR_STR( "client_hitpos" ) );
-			state.create_user_object<decltype( shot.hitpos )>( XOR_STR( "vec3" ), shot.hurt ? &shot.hitpos : &zerovec );
-			state.set_field( XOR_STR( "server_hitpos" ) );
-			state.create_table();
+		lua::api.callback(FNV1A("on_shot_registered"), [&](lua::state& state)
 			{
-				auto index = 1;
-				for ( auto cur : shot.penetration_points )
+				state.create_table();
+				state.set_field(XOR_STR("manual"), shot.hitgroup == -1);
+				state.set_field(XOR_STR("secure"), shot.safety >= penetration::safety_no_roll);
+				state.set_field(XOR_STR("very_secure"), shot.safety >= penetration::safety_full);
+				state.set_field(XOR_STR("result"), shot.hurt ? XOR_STR("hit") : shot.hit ? XOR_STR("resolve") : shot.hit_extrapolation ? (!ConVar::cl_lagcompensation || !ConVar::cl_predict) ? XOR_STR("anti-exploit") : XOR_STR("extrapolation") : shot.hit_originally ? XOR_STR("server correction") : XOR_STR("spread"));
+				state.set_field(XOR_STR("target"), shot.enemy_index);
+				state.set_field(XOR_STR("tick"), shot.tick);
+				state.set_field(XOR_STR("backtrack"), shot.record.m_shot_info.backtrack_ticks);
+				state.set_field(XOR_STR("hitchance"), shot.record.m_shot_info.hitchance);
+				state.set_field(XOR_STR("client_hitgroup"), shot.hitgroup);
+				state.set_field(XOR_STR("client_damage"), shot.damage);
+				state.set_field(XOR_STR("server_hitgroup"), shot.hitinfo.hitgroup);
+				state.set_field(XOR_STR("server_damage"), shot.hitinfo.damage);
+				state.create_user_object<decltype(shot.shotpos)>(XOR_STR("vec3"), &shot.shotpos);
+				state.set_field(XOR_STR("shotpos"));
+				state.create_user_object<decltype(end)>(XOR_STR("vec3"), &end);
+				state.set_field(XOR_STR("client_hitpos"));
+				state.create_user_object<decltype(shot.hitpos)>(XOR_STR("vec3"), shot.hurt ? &shot.hitpos : &zerovec);
+				state.set_field(XOR_STR("server_hitpos"));
+				state.create_table();
 				{
-					state.create_user_object<decltype( cur )>( XOR_STR( "vec3" ), &cur );
-					state.set_i( index++ );
+					auto index = 1;
+					for (auto cur : shot.penetration_points)
+					{
+						state.create_user_object<decltype(cur)>(XOR_STR("vec3"), &cur);
+						state.set_i(index++);
+					}
 				}
-			}
-			state.set_field( XOR_STR( "client_impacts" ) );
-			state.create_table();
-			{
-				auto index = 1;
-				for ( auto cur : shot.hitposes )
+				state.set_field(XOR_STR("client_impacts"));
+				state.create_table();
 				{
-					state.create_user_object<decltype( cur )>( XOR_STR( "vec3" ), &cur );
-					state.set_i( index++ );
+					auto index = 1;
+					for (auto cur : shot.hitposes)
+					{
+						state.create_user_object<decltype(cur)>(XOR_STR("vec3"), &cur);
+						state.set_i(index++);
+					}
 				}
-			}
-			state.set_field( XOR_STR( "server_impacts" ) );
-			return 1;
-		} );
+				state.set_field(XOR_STR("server_impacts"));
+				return 1;
+			});
 
-		if ( player->get_player_info().fakeplayer )
+		if (player->get_player_info().fakeplayer)
 		{
-			calc_missed_shots( &shot );
+			calc_missed_shots(&shot);
 
 			continue;
 		}
 
-		if ( vars::legit_enabled() )
+		if (vars::legit_enabled())
 			continue;
 
-		get_brute_angle( &shot );
+		get_brute_angle(&shot);
 
-		calc_missed_shots( &shot );
+		calc_missed_shots(&shot);
 	}
 
 	current_shots.clear();
 	unapproved_shots.clear();
 	current_hitposes.clear();
 }
+
+
 
 void resolver::get_brute_angle(shot_t* shot)
 {
