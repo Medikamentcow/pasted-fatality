@@ -1138,8 +1138,6 @@ void resolver::approve_shots(const ClientFrameStage_t& stage)
 	current_hitposes.clear();
 }
 
-
-
 void resolver::get_brute_angle(shot_t* shot)
 {
 	if (!local_player || !local_player->get_alive() || !local_weapon || shot->record.m_dormant)
@@ -1161,12 +1159,6 @@ void resolver::get_brute_angle(shot_t* shot)
 	const auto side = shot->record.m_resolver_side;
 	const auto tried_dir = shot->record.m_shot_dir;
 
-	// Biases matched to bias_to_direction thresholds:
-	//   min        < -0.55  (band center ~ -0.66)
-	//   min_extra  < -0.32  (band center ~ -0.43)
-	//   max_extra  >  0.32  (band center ~  0.43)
-	//   max        >  0.55  (band center ~  0.66)
-	// min_min / max_max removed
 	float tried_bias = 0.f;
 	switch (tried_dir)
 	{
@@ -1189,7 +1181,9 @@ void resolver::get_brute_angle(shot_t* shot)
 	const bool registered_miss = (shot->hit && !shot->hurt) || aimed_head_hit_body;
 	const bool no_registration = !shot->hit && !shot->hurt;
 
-	// ---------- Kalman update ----------
+	// =========================================================================
+	// 1. Discrete Kalman update
+	// =========================================================================
 	if (registered_hit)
 	{
 		float hurt_noise;
@@ -1204,7 +1198,7 @@ void resolver::get_brute_angle(shot_t* shot)
 		}
 
 		if (was_extrapolated)
-			hurt_noise = std::min(hurt_noise + 0.05f, 0.15f);
+			hurt_noise *= 1.35f;
 
 		update_kalman(log, tried_bias, hurt_noise);
 	}
@@ -1218,8 +1212,9 @@ void resolver::get_brute_angle(shot_t* shot)
 				: 0.08f - commitment * 0.02f;
 
 			if (was_extrapolated)
-				miss_noise = std::min(miss_noise + 0.08f, 0.40f);
+				miss_noise *= 1.35f;
 
+			miss_noise = std::clamp(miss_noise, 0.06f, 0.40f);
 			update_kalman(log, -tried_bias, miss_noise);
 		}
 	}
@@ -1231,13 +1226,16 @@ void resolver::get_brute_angle(shot_t* shot)
 			float noreg_noise = 0.25f - commitment * 0.10f;
 
 			if (was_extrapolated)
-				noreg_noise = std::min(noreg_noise + 0.10f, 0.45f);
+				noreg_noise *= 1.35f;
 
+			noreg_noise = std::clamp(noreg_noise, 0.12f, 0.45f);
 			update_kalman(log, -tried_bias, noreg_noise);
 		}
 	}
 
-	// ---------- Blacklist ----------
+	// =========================================================================
+	// 2. Blacklist hygiene
+	// =========================================================================
 	if (!no_registration)
 	{
 		auto& bl = log.m_mode[mode].m_side[side].m_blacklist;
@@ -1251,7 +1249,6 @@ void resolver::get_brute_angle(shot_t* shot)
 
 		const float hysteresis = 0.35f;
 
-		// Only the directions bias_to_direction still uses
 		if (bl[resolver_direction::resolver_min_extra] && bias > -0.55f + hysteresis)
 			bl[resolver_direction::resolver_min_extra] = false;
 		if (bl[resolver_direction::resolver_min] && bias > -0.32f + hysteresis)
@@ -1263,7 +1260,9 @@ void resolver::get_brute_angle(shot_t* shot)
 			bl[resolver_direction::resolver_max] = false;
 	}
 
-	// ---------- Unknown flag handling ----------
+	// =========================================================================
+	// 3. Unknown flags
+	// =========================================================================
 	if (log.m_mode[mode].m_side[side].m_current_dir != tried_dir || registered_hit)
 	{
 		if (mode == resolver_mode::resolver_shot)
@@ -1271,6 +1270,71 @@ void resolver::get_brute_angle(shot_t* shot)
 		else
 			log.m_unknown = false;
 	}
+
+	// =========================================================================
+	// 4. Geometric backsolve
+	// =========================================================================
+	const bool resolve_miss = shot->hit && !shot->hurt;
+	if (!resolve_miss && !aimed_head_hit_body)
+		return;
+
+	Vector server_pos{};
+	if (shot->hurt && !shot->hitpos.IsZero())
+		server_pos = shot->hitpos;
+	else if (!shot->hitposes.empty())
+		server_pos = shot->hitposes.back();
+	else
+		return;
+
+	const float dist_to_player = server_pos.Dist(shot->record.m_origin);
+	if (dist_to_player < 5.f || dist_to_player > 80.f)
+		return;
+
+	const auto mat = shot->record.matrix(tried_dir);
+	if (!mat)
+		return;
+
+	// Head bone — change index if your studio head bone differs
+	Vector resolved_head{
+		mat[8][0][3],
+		mat[8][1][3],
+		mat[8][2][3]
+	};
+
+	if (fabsf(server_pos.z - resolved_head.z) > 40.f)
+		return;
+
+	Vector to_resolved = resolved_head - shot->record.m_origin;
+	Vector to_server = server_pos - shot->record.m_origin;
+	to_resolved.z = 0.f;
+	to_server.z = 0.f;
+
+	const float len_res = to_resolved.Length();
+	const float len_srv = to_server.Length();
+	if (len_res < 2.f || len_srv < 2.f)
+		return;
+
+	const float cross = to_resolved.x * to_server.y - to_resolved.y * to_server.x;
+	const float lateral = cross / len_res;
+
+	if (fabsf(lateral) < 2.5f)
+		return;
+
+	// Distance-aware scale (desync lever arm)
+	const float scale = std::clamp(0.5f * (12.f + len_res), 8.f, 16.f);
+	const float measurement = std::clamp(-lateral / scale, -1.f, 1.f);
+
+	float noise = aimed_head_hit_body ? 0.11f : 0.15f;
+
+	if (shot->record.m_shot_info.hitchance >= 85.f)
+		noise *= 0.85f;
+
+	if (was_extrapolated)
+		noise *= 1.35f;
+
+	noise = std::clamp(noise, 0.08f, 0.40f);
+
+	update_kalman(log, measurement, noise);
 }
 
 void resolver::calc_missed_shots(shot_t* shot)
