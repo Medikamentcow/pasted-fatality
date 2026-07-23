@@ -10,10 +10,12 @@ void resolver::resolve(C_CSPlayer* player, lag_record_t* record, lag_record_t* p
 		pitch_resolve(record);
 
 	auto& log = player_log::get_log(player->EntIndex());
+
 	update_animation_features(log, record);
 	update_kalman_from_anim(log);
 
-	yaw_resolve(record, previous);
+	if (!player->get_player_info().fakeplayer)
+		yaw_resolve(record, previous);
 }
 
 void resolver::post_animate(C_CSPlayer* player, lag_record_t* record)
@@ -82,9 +84,6 @@ void resolver::post_animate(C_CSPlayer* player, lag_record_t* record)
 
 			log.m_kalman.variance = std::min(log.m_kalman.variance + extra, 0.50f);
 		}
-
-		const auto dir = bias_to_direction(log.m_kalman.bias);
-		log.m_mode[mode_to_write].m_side[log.m_current_side].m_current_dir = dir;
 	}
 }
 
@@ -534,51 +533,61 @@ resolver_direction resolver::bias_to_direction(float bias)
 
 void resolver::yaw_resolve(const lag_record_t* record, const lag_record_t* previous)
 {
-	if (record->m_shot || (previous && previous->m_shot))
+	if (!record || record->m_shot || (previous && previous->m_shot))
 		return;
 
 	auto& log = player_log::get_log(record->m_index);
 	const auto& anim = log.m_anim;
 
-	// If Kalman is already confident, don't let mode flips fight it
-	const float confidence = 1.f - std::clamp(log.m_kalman.variance, 0.f, 1.f);
-	if (confidence > 0.70f && fabsf(log.m_kalman.bias) > 0.40f)
-		return;
-
 	float layer6_delta = 0.f;
-	float feet_delta_change = 0.f;
 	float layer3_delta = 0.f;
+	float feet_delta_change = 0.f;
 
 	if (previous)
 	{
 		layer6_delta = fabsf(record->m_layers[6].m_flWeight - previous->m_layers[6].m_flWeight);
+		layer3_delta = fabsf(record->m_layers[3].m_flWeight - previous->m_layers[3].m_flWeight);
 
 		const float prev_feet = previous->m_state[resolver_direction::resolver_networked].m_animstate.foot_yaw;
 		const float prev_eye_feet = math::normalize_float(previous->m_eye_angles.y - prev_feet);
 		feet_delta_change = fabsf(anim.eye_feet_delta - prev_eye_feet);
-
-		// ============ HEURISTIC: Layer 3 Snap = Early Flip Signal ============
-		layer3_delta = fabsf(record->m_layers[3].m_flWeight - previous->m_layers[3].m_flWeight);
 	}
 
 	const bool standing = anim.is_standing && anim.standing_ticks > 1;
-	const bool strong_layer_flip = standing && layer6_delta > 0.55f && anim.standing_ticks > 6;
-	const bool strong_feet_flip = !anim.is_moving && feet_delta_change > 40.f;
+	const bool strong_layer6 = standing && layer6_delta > 0.45f;
+	const bool strong_layer3 = standing && layer3_delta > 0.40f;
+	const bool strong_feet = !anim.is_moving && feet_delta_change > 40.f;
 	const bool extreme_desync = fabsf(anim.eye_feet_delta) > 105.f;
+	const bool lby_flip = anim.lby_snapped;
 
-	// ============ HEURISTIC: Layer 3 Snap Predictor ============
-	// Layer 3 snaps *before* layer 6 settles, so catch it early
-	const bool layer3_flip_signal = layer3_delta > 0.40f && standing && anim.standing_ticks > 6;
-
-	const auto previous_mode = log.m_current_mode;
-
-	if (strong_layer_flip || strong_feet_flip || extreme_desync || layer3_flip_signal)
+	const bool pattern_break = strong_layer6 || strong_layer3 || strong_feet || extreme_desync || lby_flip;
+	if (!pattern_break)
 	{
-		log.m_current_mode = static_cast<resolver_mode>(!static_cast<int>(log.m_current_mode));
+		// Idle: eventually fall back to default mode bucket (blacklist hygiene only)
+		if (interfaces::client_state()->get_last_server_tick() - log.m_last_flip_tick > time_to_ticks(1.1f))
+			log.m_current_mode = resolver_mode::resolver_default;
+		return;
 	}
 
-	if (previous_mode != log.m_current_mode)
+	// ----- Volatility signal for Kalman (this is the point of mode-flip now) -----
+	log.m_kalman.variance = std::min(log.m_kalman.variance + 0.18f, 0.55f);
+	log.m_kalman.bias *= 0.85f; // allow side to move after AA flip
+
+	// Mode toggle is optional bookkeeping for per-mode blacklist only — does NOT pick shot dir
+	const float confidence = 1.f - std::clamp(log.m_kalman.variance, 0.f, 1.f);
+	if (confidence < 0.70f || fabsf(log.m_kalman.bias) < 0.40f)
+	{
+		const auto previous_mode = log.m_current_mode;
+		log.m_current_mode = static_cast<resolver_mode>(!static_cast<int>(log.m_current_mode));
+
+		if (previous_mode != log.m_current_mode)
+			log.m_last_flip_tick = interfaces::client_state()->get_last_server_tick();
+	}
+	else
+	{
+		// Confident filter: still opened variance above, but don't thrash mode buckets
 		log.m_last_flip_tick = interfaces::client_state()->get_last_server_tick();
+	}
 }
 
 void resolver::on_createmove()
