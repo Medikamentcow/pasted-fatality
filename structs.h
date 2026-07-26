@@ -486,6 +486,16 @@ struct player_log_t
 
 	anim_info_t m_anim{};
 
+	// --- Flip rhythm predictor ---
+	std::array<int, 5> m_flip_intervals{};
+	int  m_flip_interval_head = 0;
+	int  m_flip_interval_count = 0;
+	int  m_last_flip_tick = 0;   // already present, keep it
+
+	// Replaces the old kalman.bias touch — readable by the resolver dispatch
+	bool  m_flip_imminent = false;
+	float m_flip_mean_interval = 0.f;  // cached for archetype classifier later
+
 	C_CSPlayer* player = nullptr;
 	int64_t xuid = 0;
 	CBaseHandle handle{};
