@@ -371,30 +371,24 @@ void resolver::update_anim_info(player_log_t& log, lag_record_t* record, lag_rec
 		a.layer3_cycle_delta > 0.30f;
 
 	// =========================================================================
-	// Jitter / body-yaw sampling
-	// Use our own cycle/weight deltas — do NOT rely on m_flPrevCycle on records.
+	// Jitter / body-yaw sampling (+ bimodal tracking)
 	// =========================================================================
 	const bool whole_body_idle = a.layer12_weight < 0.25f;
 
-	// Strong commit: adjust layer moved hard or LBY feet snap
 	const bool l3_commit =
 		a.layer3_weight > 0.01f &&
 		(a.layer3_cycle_delta > 0.12f || a.layer3_weight_delta > 0.20f || a.layer3_break);
 
-	// Weaker standing desync sample so we still warm up without a perfect LBY event
 	const bool standing_desync_sample =
 		a.is_standing &&
 		a.standing_ticks >= 3 &&
 		whole_body_idle &&
 		fabsf(a.eye_feet_delta) > 12.f;
 
-	// Throttle weak samples so we don't flood EWMA every tick
-	static thread_local int s_last_weak_sample_tick[65]{};
-	const int idx = std::clamp(record->m_index, 0, 64);
 	const int cur_tick = interfaces::client_state()->get_last_server_tick();
 	const bool weak_ok =
 		standing_desync_sample &&
-		(cur_tick - s_last_weak_sample_tick[idx] >= 2);
+		(cur_tick - a.last_weak_sample_tick >= 2);
 
 	const bool should_sample =
 		a.is_standing &&
@@ -404,7 +398,7 @@ void resolver::update_anim_info(player_log_t& log, lag_record_t* record, lag_rec
 	if (should_sample)
 	{
 		if (weak_ok && !(l3_commit || a.lby_snapped))
-			s_last_weak_sample_tick[idx] = cur_tick;
+			a.last_weak_sample_tick = cur_tick;
 
 		const float sample = a.eye_yaw;
 
@@ -412,12 +406,28 @@ void resolver::update_anim_info(player_log_t& log, lag_record_t* record, lag_rec
 		{
 			j.ewma = sample;
 			j.ewm_var = 0.f;
+			j.last_delta_sign = 0;
+			j.sign_flip_count = 0;
+			j.is_bimodal = false;
 		}
 		else
 		{
 			float delta = sample - j.ewma;
 			while (delta > 180.f)  delta -= 360.f;
 			while (delta < -180.f) delta += 360.f;
+
+			const int cur_sign = (delta > 0.f) ? 1 : (delta < 0.f ? -1 : 0);
+			if (cur_sign != 0 && j.last_delta_sign != 0)
+			{
+				if (cur_sign != j.last_delta_sign)
+					j.sign_flip_count++;
+				else
+					j.sign_flip_count = std::max(0, j.sign_flip_count - 1);
+			}
+			if (cur_sign != 0)
+				j.last_delta_sign = cur_sign;
+
+			j.is_bimodal = j.sign_flip_count >= 3;
 
 			j.ewma += j.ALPHA * delta;
 			while (j.ewma > 180.f)  j.ewma -= 360.f;
@@ -430,37 +440,59 @@ void resolver::update_anim_info(player_log_t& log, lag_record_t* record, lag_rec
 		j.last_commit_tick = cur_tick;
 		j.sample_count = std::min(j.sample_count + 1, 64);
 
-		// Keep confidence partially fresh even before yaw_resolve runs
-		const float var_conf = 1.f - clamp(
-			(j.ewm_var - j.VAR_LOW) / (j.VAR_HIGH - j.VAR_LOW),
-			0.f, 1.f);
-		j.confidence = var_conf; // recency applied fully in yaw_resolve
+		if (!j.is_bimodal)
+		{
+			const float var_conf = 1.f - clamp(
+				(j.ewm_var - j.VAR_LOW) / (j.VAR_HIGH - j.VAR_LOW),
+				0.f, 1.f);
+			j.confidence = var_conf;
+		}
+		else
+		{
+			j.confidence = std::min(1.f, 0.45f + 0.1f * static_cast<float>(j.sign_flip_count));
+		}
 	}
 }
 
 void resolver::yaw_resolve(const lag_record_t* record, const lag_record_t* previous)
 {
-	if (record->m_shot || (previous && previous->m_shot))
+	if (!record || record->m_shot || (previous && previous->m_shot))
 		return;
 
 	auto& log = player_log::get_log(record->m_index);
+	const auto& a = log.m_anim;
 	auto& j = log.m_jitter;
 
-	// ── delta-based mode baseline ─────────────────────────────────────────────
-	const auto delta = !previous
-		? 0.f
-		: math::normalize_float(record->m_eye_angles.y - previous->m_eye_angles.y);
-
-	const auto use_nonflip = delta < -30.f;
-	const auto use_flip = delta > 30.f;
-
+	// =========================================================================
+	// 1. MODE
+	// =========================================================================
 	const auto previous_mode = log.m_current_mode;
 
-	if ((log.m_current_mode == resolver_mode::resolver_flip && use_nonflip)
-		|| (log.m_current_mode == resolver_mode::resolver_default && use_flip))
+	const bool big_eye_turn = fabsf(a.eye_yaw_delta) > 30.f;
+	const bool huge_eye_turn = fabsf(a.eye_yaw_delta) > 170.f;
+	const bool anim_break =
+		a.layer7_strafe_break ||
+		a.layer6_break ||
+		a.layer3_break ||
+		a.lby_snapped;
+
+	const bool want_flip =
+		(a.eye_yaw_delta > 30.f) ||
+		(anim_break && a.eye_yaw_delta > 10.f);
+
+	const bool want_nonflip =
+		(a.eye_yaw_delta < -30.f) ||
+		(anim_break && a.eye_yaw_delta < -10.f);
+
+	if ((log.m_current_mode == resolver_mode::resolver_flip && want_nonflip) ||
+		(log.m_current_mode == resolver_mode::resolver_default && want_flip))
+	{
 		log.m_current_mode = static_cast<resolver_mode>(!static_cast<int>(log.m_current_mode));
-	else if (fabsf(delta) > 170.f)
+	}
+	else if (huge_eye_turn || (anim_break && big_eye_turn))
+	{
 		log.m_current_mode = static_cast<resolver_mode>(!static_cast<int>(log.m_current_mode));
+	}
 
 	if (previous_mode != log.m_current_mode)
 		log.m_last_flip_tick = interfaces::client_state()->get_last_server_tick();
@@ -468,51 +500,121 @@ void resolver::yaw_resolve(const lag_record_t* record, const lag_record_t* previ
 	if (interfaces::client_state()->get_last_server_tick() - log.m_last_flip_tick > time_to_ticks(1.1f))
 		log.m_current_mode = resolver_mode::resolver_default;
 
-	// ── jitter distribution side override ────────────────────────────────────
-	// wall_detect resolved a side from geometry — higher confidence than stats
+	// =========================================================================
+	// 2. SIDE — wall > jitter (mono / bimodal) > eye_feet
+	// =========================================================================
+	bool side_set = false;
+
+	// 2a. Wall
 	if (log.m_wall_side_valid)
-		return;
+		side_set = true;
 
-	// need a warm sample set before the distribution is meaningful
-	if (j.sample_count < j.MIN_SAMPLES)
-		return;
+	// 2b. Jitter
+	if (!side_set && j.sample_count >= j.MIN_SAMPLES)
+	{
+		const int ticks_since =
+			interfaces::client_state()->get_last_server_tick() - j.last_commit_tick;
 
-	const int ticks_since = interfaces::client_state()->get_last_server_tick() - j.last_commit_tick;
+		const float recency_conf = 1.f - clamp(
+			static_cast<float>(ticks_since) / static_cast<float>(j.COMMIT_FRESH_TICKS),
+			0.f, 1.f);
 
-	// variance confidence: tight clustering → high, wide spread → low
-	const float var_conf = 1.f - clamp(
-		(j.ewm_var - j.VAR_LOW) / (j.VAR_HIGH - j.VAR_LOW),
-		0.f, 1.f
-	);
+		float body_yaw = j.ewma;
+		bool  can_use = false;
 
-	// recency confidence: decays linearly, floors at 0.1 so old data still weakly votes
-	const float recency_conf = 1.f - clamp(
-		static_cast<float>(ticks_since) / static_cast<float>(j.COMMIT_FRESH_TICKS),
-		0.f, 1.f
-	);
+		if (j.is_bimodal)
+		{
+			const float spread = sqrtf(std::max(j.ewm_var, 1.f));
+			const float cluster_hi = math::normalize_float(j.ewma + spread);
+			const float cluster_lo = math::normalize_float(j.ewma - spread);
 
-	j.confidence = var_conf * std::max(recency_conf, 0.1f);
+			const float diff_hi = fabsf(math::angle_diff(record->m_eye_angles.y, cluster_hi));
+			const float diff_lo = fabsf(math::angle_diff(record->m_eye_angles.y, cluster_lo));
 
-	if (j.confidence < j.CONFIDENCE_GATE)
-		return;
+			body_yaw = (diff_hi > diff_lo) ? cluster_hi : cluster_lo;
 
-	// lerp from the last committed body yaw toward the long-run mean as the commit ages
-	const float blend_t = clamp(
-		static_cast<float>(ticks_since) / static_cast<float>(j.COMMIT_FRESH_TICKS),
-		0.f, 1.f
-	);
-	const float body_yaw = math::lerp(j.last_commit_yaw, j.ewma, blend_t);
+			j.confidence = std::min(1.f, 0.45f + 0.1f * static_cast<float>(j.sign_flip_count))
+				* std::max(recency_conf, 0.1f);
 
-	// signed arc: positive → eye is left of body → body is to the right
-	const float offset = math::angle_diff(record->m_eye_angles.y, body_yaw);
+			can_use = j.sign_flip_count >= 3 && recency_conf > 0.15f;
+		}
+		else
+		{
+			const float var_conf = 1.f - clamp(
+				(j.ewm_var - j.VAR_LOW) / (j.VAR_HIGH - j.VAR_LOW),
+				0.f, 1.f);
 
-	constexpr float DEADZONE = 5.f;
-	if (std::fabsf(offset) < DEADZONE)
-		return;
+			j.confidence = var_conf * std::max(recency_conf, 0.1f);
 
-	log.m_current_side = (offset > 0.f)
-		? resolver_side::resolver_right
-		: resolver_side::resolver_left;
+			const float blend_t = clamp(
+				static_cast<float>(ticks_since) / static_cast<float>(j.COMMIT_FRESH_TICKS),
+				0.f, 1.f);
+			body_yaw = math::lerp(j.last_commit_yaw, j.ewma, blend_t);
+
+			can_use = j.confidence >= j.CONFIDENCE_GATE;
+		}
+
+		if (can_use)
+		{
+			const float offset = math::angle_diff(record->m_eye_angles.y, body_yaw);
+
+			constexpr float DEADZONE = 5.f;
+			if (fabsf(offset) >= DEADZONE)
+			{
+				log.m_current_side = (offset > 0.f)
+					? resolver_side::resolver_right
+					: resolver_side::resolver_left;
+				side_set = true;
+			}
+		}
+	}
+
+	// 2c. Eye / feet (and move blend)
+	if (!side_set)
+	{
+		float side_signal = a.eye_feet_delta;
+
+		if (a.is_moving && a.speed_2d > 20.f)
+			side_signal = a.eye_feet_delta * 0.55f + a.velocity_yaw_delta * 0.45f;
+
+		if (fabsf(side_signal) >= 5.f)
+		{
+			log.m_current_side = (side_signal < 0.f)
+				? resolver_side::resolver_left
+				: resolver_side::resolver_right;
+		}
+		side_set = true;
+	}
+
+	// =========================================================================
+	// 3. DIR — min/max + blacklist
+	// =========================================================================
+	auto& slot = log.m_mode[log.m_current_mode].m_side[log.m_current_side];
+
+	resolver_direction picked =
+		(log.m_current_side == resolver_side::resolver_left)
+		? resolver_direction::resolver_min
+		: resolver_direction::resolver_max;
+
+	if (fabsf(a.eye_feet_delta) > 25.f)
+	{
+		picked = (a.eye_feet_delta < 0.f)
+			? resolver_direction::resolver_min
+			: resolver_direction::resolver_max;
+	}
+
+	if (slot.m_blacklist[picked])
+	{
+		const auto opposite =
+			(picked == resolver_direction::resolver_min)
+			? resolver_direction::resolver_max
+			: resolver_direction::resolver_min;
+
+		if (!slot.m_blacklist[opposite])
+			picked = opposite;
+	}
+
+	slot.m_current_dir = picked;
 }
 
 void resolver::on_createmove()
