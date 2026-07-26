@@ -22,6 +22,7 @@ void resolver::post_animate(C_CSPlayer* player, lag_record_t* record)
 {
 	auto& log = player_log::get_log(player->EntIndex());
 
+	// ----- Invalid dir clamp (table hygiene only) -----
 	if (vars::aim.resolver_mode->get<int>())
 	{
 		for (auto& mode : log.m_mode)
@@ -58,32 +59,65 @@ void resolver::post_animate(C_CSPlayer* player, lag_record_t* record)
 			log.m_last_zero_pitch = interfaces::globals()->curtime;
 	}
 
-	if (log.m_unknown_shot && log.m_mode[log.m_current_mode].m_side[log.m_current_side].m_current_dir > resolver_direction::resolver_networked)
+	if (log.m_unknown_shot &&
+		log.m_mode[log.m_current_mode].m_side[log.m_current_side].m_current_dir > resolver_direction::resolver_networked)
 	{
 		log.m_mode[resolver_mode::resolver_shot].m_side[log.m_current_side].m_current_dir =
 			log.m_mode[log.m_current_mode].m_side[log.m_current_side].m_current_dir;
 	}
 
-	if (!record->m_shot && player->is_enemy() && !player->get_player_info().fakeplayer)
+	// =========================================================================
+	// Kalman writes: cold start / freestand / air / extrapolate
+	// (aim dir still only applied in hitscan + fire via bias_to_direction)
+	// =========================================================================
+	if (record->m_shot || !player->is_enemy() || player->get_player_info().fakeplayer)
+		return;
+
+	const bool in_air = !(record->m_flags & FL_ONGROUND);
+	const bool cold =
+		log.m_kalman.variance > 0.35f ||
+		log.m_shots == 0 ||
+		log.m_enter_pvs; // first sight after PVS if you have this flag
+
+	// --- First sight / dormant re-entry: open the filter ---
+	if (log.m_enter_pvs)
 	{
-		const auto mode_to_write = record->m_resolver_mode;
+		log.m_kalman.variance = std::max(log.m_kalman.variance, 0.40f);
+		// optional: clear enter flag elsewhere once consumed
+	}
 
-		if (log.m_kalman.variance > 0.35f)
+	// --- Freestand prior when uncertain or airborne ---
+	const float var_gate = in_air ? 0.22f : (cold ? 0.28f : 0.35f);
+
+	if (log.m_kalman.variance > var_gate)
+	{
+		float strength = 0.35f;
+		float noise = 0.55f;
+
+		if (in_air)
 		{
-			if (log.m_current_side == resolver_side::resolver_left)
-				update_kalman(log, -0.35f, 0.55f);
-			else if (log.m_current_side == resolver_side::resolver_right)
-				update_kalman(log, 0.35f, 0.55f);
+			strength = 0.50f;
+			noise = 0.38f;
+		}
+		else if (cold)
+		{
+			strength = 0.45f;
+			noise = 0.42f;
 		}
 
-		if (record->m_extrapolated)
-		{
-			const float extra = record->m_extrapolate_amt > 0
-				? 0.04f * static_cast<float>(record->m_extrapolate_amt)
-				: 0.06f;
+		if (log.m_current_side == resolver_side::resolver_left)
+			update_kalman(log, -strength, noise);
+		else if (log.m_current_side == resolver_side::resolver_right)
+			update_kalman(log, strength, noise);
+	}
 
-			log.m_kalman.variance = std::min(log.m_kalman.variance + extra, 0.50f);
-		}
+	// --- Extrapolated pose: less confidence ---
+	if (record->m_extrapolated)
+	{
+		const float extra = record->m_extrapolate_amt > 0
+			? 0.04f * static_cast<float>(record->m_extrapolate_amt)
+			: 0.06f;
+		log.m_kalman.variance = std::min(log.m_kalman.variance + extra, 0.50f);
 	}
 }
 
@@ -272,17 +306,49 @@ bool resolver::extrapolate_record(int ticks, lag_record_t& outrecord, const bool
 
 void resolver::pitch_resolve(lag_record_t* record)
 {
-	const auto& log = player_log::get_log(record->m_index);
+	auto& log = player_log::get_log(record->m_index);
 
+	// Always keep raw cmd pitch for detection
+	record->m_cmd_pitch = record->m_eye_angles.x;
+	record->m_pitch_jitter = false;
+
+	// ----- Nospread only: alternate pitch -----
 	if (globals::nospread)
 	{
 		if (log.nospread.m_pitch_cycle % 2 && log.nospread.m_can_fake)
-		{
 			record->m_eye_angles.x = -record->m_eye_angles.x;
+
+		record->m_pitch_cycle = log.nospread.m_pitch_cycle;
+		return;
+	}
+
+	record->m_pitch_cycle = 0;
+
+	// ----- Normal play: detect, don't rewrite -----
+	const float pitch = record->m_cmd_pitch;
+	const float abs_pitch = fabsf(pitch);
+
+	// 1) Pitch jitter vs last non-shot record
+	if (!log.record.empty())
+	{
+		const auto& prev = log.record.back();
+		if (!prev.m_shot && !record->m_shot)
+		{
+			const float delta = fabsf(pitch - prev.m_cmd_pitch);
+			// Large flip while still "looking" usable angles
+			if (delta > 45.f && abs_pitch < 89.f && fabsf(prev.m_cmd_pitch) < 89.f)
+				record->m_pitch_jitter = true;
 		}
 	}
 
-	record->m_pitch_cycle = log.nospread.m_pitch_cycle;
+	// 2) Unusual patterns (for existing safety logic in hitscan)
+	//    post_animate already tracks m_last_unusual_pitch / m_last_zero_pitch
+	//    Keep eye angles as networked — matrices/hitboxes already use bones
+
+	// 3) Optional: clamp only garbage for anything that still reads eye pitch
+	//    (does not change bones; only cleans absurd values)
+	if (abs_pitch > 89.f)
+		record->m_eye_angles.x = pitch > 0.f ? 89.f : -89.f;
 }
 
 
@@ -306,7 +372,6 @@ void resolver::update_animation_features(player_log_t& log, lag_record_t* record
 
 	auto& anim = log.m_anim;
 
-	// ----- Animation layers -----
 	const auto& layers = record->m_layers;
 	anim.layer3_weight = layers[3].m_flWeight;
 	anim.layer3_cycle = layers[3].m_flCycle;
@@ -315,7 +380,6 @@ void resolver::update_animation_features(player_log_t& log, lag_record_t* record
 	anim.layer12_weight = layers[12].m_flWeight;
 	anim.layer12_cycle = layers[12].m_flCycle;
 
-	// ----- Yaws -----
 	const auto& animstate = record->m_state[resolver_direction::resolver_networked].m_animstate;
 	anim.eye_yaw = record->m_eye_angles.y;
 
@@ -326,14 +390,14 @@ void resolver::update_animation_features(player_log_t& log, lag_record_t* record
 	const float feet_snap_delta = fabsf(math::normalize_float(anim.feet_yaw - anim.prev_feet_yaw));
 	anim.lby_snapped = (feet_snap_delta > 20.f && feet_snap_delta < 170.f);
 
-	// ----- Movement state -----
 	const Vector& vel = record->m_calculated_velocity.Length2D() > 1.f
 		? record->m_calculated_velocity
 		: record->m_velocity;
 	const float speed_2d = vel.Length2D();
 
+	anim.on_ground = (record->m_flags & FL_ONGROUND) != 0;
 	anim.is_moving = speed_2d > 5.f;
-	anim.is_standing = !anim.is_moving && (record->m_flags & FL_ONGROUND);
+	anim.is_standing = !anim.is_moving && anim.on_ground;
 	anim.speed_2d = speed_2d;
 
 	if (anim.is_standing)
@@ -440,7 +504,13 @@ void resolver::update_kalman_from_anim(player_log_t& log)
 	float measurement = 0.f;
 	float noise = 0.90f;
 
-	if (anim.is_standing && anim.standing_ticks > 2)
+	if (!anim.on_ground)
+	{
+		// Air: ignore velocity yaw
+		measurement = std::clamp(anim.eye_feet_delta / 58.f, -1.f, 1.f);
+		noise = 0.70f;
+	}
+	else if (anim.is_standing && anim.standing_ticks > 2)
 	{
 		measurement = std::clamp(anim.eye_feet_delta / 58.f, -1.f, 1.f);
 		noise = 0.25f;
@@ -451,14 +521,12 @@ void resolver::update_kalman_from_anim(player_log_t& log)
 		if (anim.layer6_weight > 0.55f && anim.layer12_weight > 0.40f)
 			noise = 0.13f;
 
-		// Aggressive standing lock-in
 		if (anim.standing_ticks > 16 && fabsf(anim.eye_feet_delta) > 18.f)
 			noise = std::max(noise - 0.06f, 0.07f);
 
 		if (anim.standing_ticks > 30 && fabsf(anim.eye_feet_delta) > 22.f)
 			noise = std::max(noise - 0.03f, 0.05f);
 
-		// Layer 6 jitter protection (per-player)
 		const float layer6_delta = fabsf(anim.layer6_weight - anim.prev_layer6_weight);
 		anim.prev_layer6_weight = anim.layer6_weight;
 
@@ -467,15 +535,12 @@ void resolver::update_kalman_from_anim(player_log_t& log)
 		else if (layer6_delta > 0.06f)
 			noise = std::min(noise + 0.07f, 0.40f);
 
-		// Layer 12 trust — tighten noise only (no direct bias write)
 		if (anim.layer12_weight > 0.65f && anim.standing_ticks > 15)
 			noise *= 0.80f;
 
-		// Layer 6 locked + strong desync — trust measurement more
 		if (layer6_delta < 0.03f && fabsf(measurement) > 0.65f)
 			noise = std::max(noise * 0.85f, 0.06f);
 
-		// Layer 3 snap — AA likely flipped, loosen filter
 		const float layer3_delta = fabsf(anim.layer3_weight - anim.prev_layer3_weight);
 		anim.prev_layer3_weight = anim.layer3_weight;
 
@@ -485,14 +550,12 @@ void resolver::update_kalman_from_anim(player_log_t& log)
 			k.variance = std::max(k.variance, 0.08f);
 		}
 
-		// Long idle + high layer12 — max confidence window
 		if (anim.standing_ticks > 20 && anim.layer12_weight > 0.70f)
 		{
 			k.variance = std::min(k.variance, 0.12f);
 			noise = std::min(noise, 0.08f);
 		}
 
-		// LBY snap — stronger trust in the new feet direction briefly
 		if (anim.lby_snapped)
 			noise = std::min(noise, 0.12f);
 	}
@@ -500,7 +563,6 @@ void resolver::update_kalman_from_anim(player_log_t& log)
 	{
 		measurement = std::clamp(anim.velocity_yaw_delta / 65.f, -1.f, 1.f);
 
-		// Speed-scaled noise (fixes slow-move hesitation)
 		if (anim.speed_2d < 40.f)
 			noise = 0.35f;
 		else if (anim.speed_2d < 90.f)
@@ -517,17 +579,57 @@ void resolver::update_kalman_from_anim(player_log_t& log)
 	update_kalman(log, measurement, noise);
 }
 
-resolver_direction resolver::bias_to_direction(float bias)
+resolver_direction resolver::bias_to_direction(float bias, resolver_direction current)
 {
-	const float hysteresis = 0.10f;
+	// Enter thresholds (slightly soft)
+	constexpr float enter_extra = 0.55f;
+	constexpr float enter_base = 0.32f;
+	constexpr float enter_zero = 0.18f;
 
-	if (bias < -0.55f + hysteresis) return resolver_direction::resolver_min_extra;
-	if (bias < -0.32f + hysteresis) return resolver_direction::resolver_min;
+	// Extra distance required to *leave* a band (stops flicker)
+	constexpr float hold = 0.10f;
 
-	if (bias > 0.55f - hysteresis) return resolver_direction::resolver_max_extra;
-	if (bias > 0.32f - hysteresis) return resolver_direction::resolver_max;
+	const float a = fabsf(bias);
 
-	if (fabsf(bias) < 0.20f) return resolver_direction::resolver_zero;
+	// ----- Hold current band until bias clearly leaves it -----
+	switch (current)
+	{
+	case resolver_direction::resolver_min_extra:
+		if (bias < -(enter_extra - hold))
+			return resolver_direction::resolver_min_extra;
+		break;
+
+	case resolver_direction::resolver_min:
+		if (bias < -(enter_base - hold) && bias >= -(enter_extra + hold))
+			return resolver_direction::resolver_min;
+		break;
+
+	case resolver_direction::resolver_max_extra:
+		if (bias > (enter_extra - hold))
+			return resolver_direction::resolver_max_extra;
+		break;
+
+	case resolver_direction::resolver_max:
+		if (bias > (enter_base - hold) && bias <= (enter_extra + hold))
+			return resolver_direction::resolver_max;
+		break;
+
+	case resolver_direction::resolver_zero:
+		if (a < enter_zero + hold)
+			return resolver_direction::resolver_zero;
+		break;
+
+	default:
+		break;
+	}
+
+	// ----- Fresh classification -----
+	if (bias < -enter_extra) return resolver_direction::resolver_min_extra;
+	if (bias < -enter_base)  return resolver_direction::resolver_min;
+	if (bias > enter_extra) return resolver_direction::resolver_max_extra;
+	if (bias > enter_base)  return resolver_direction::resolver_max;
+	if (a < enter_zero)      return resolver_direction::resolver_zero;
+
 	return resolver_direction::resolver_networked;
 }
 
@@ -563,17 +665,15 @@ void resolver::yaw_resolve(const lag_record_t* record, const lag_record_t* previ
 	const bool pattern_break = strong_layer6 || strong_layer3 || strong_feet || extreme_desync || lby_flip;
 	if (!pattern_break)
 	{
-		// Idle: eventually fall back to default mode bucket (blacklist hygiene only)
 		if (interfaces::client_state()->get_last_server_tick() - log.m_last_flip_tick > time_to_ticks(1.1f))
 			log.m_current_mode = resolver_mode::resolver_default;
 		return;
 	}
 
-	// ----- Volatility signal for Kalman (this is the point of mode-flip now) -----
+	// Volatility for Kalman
 	log.m_kalman.variance = std::min(log.m_kalman.variance + 0.18f, 0.55f);
-	log.m_kalman.bias *= 0.85f; // allow side to move after AA flip
+	log.m_kalman.bias *= 0.85f;
 
-	// Mode toggle is optional bookkeeping for per-mode blacklist only — does NOT pick shot dir
 	const float confidence = 1.f - std::clamp(log.m_kalman.variance, 0.f, 1.f);
 	if (confidence < 0.70f || fabsf(log.m_kalman.bias) < 0.40f)
 	{
@@ -585,7 +685,6 @@ void resolver::yaw_resolve(const lag_record_t* record, const lag_record_t* previ
 	}
 	else
 	{
-		// Confident filter: still opened variance above, but don't thrash mode buckets
 		log.m_last_flip_tick = interfaces::client_state()->get_last_server_tick();
 	}
 }
@@ -781,14 +880,27 @@ void resolver::hurt_listener(IGameEvent* game_event, record_shot_info_t& shot_in
 	}
 }
 
-resolver::shot_t* resolver::closest_shot(int tickcount)
+resolver::shot_t* resolver::closest_shot(int tickcount,int command_number)
 {
 	shot_t* closest_shot = nullptr;
+	int best_score = INT_MAX;
+
 	for (auto& shot : shots)
 	{
-		closest_shot = &shot;
-		break;
+		// Exact command match wins
+		if (command_number > 0 && shot.cmdnum == command_number)
+			return &shot;
+
+		const int dist = abs(shot.tick - tickcount);
+		if (dist < best_score)
+		{
+			best_score = dist;
+			closest_shot = &shot;
+		}
 	}
+
+	if (closest_shot && best_score > time_to_ticks(1.0f))
+		return nullptr;
 
 	return closest_shot;
 }
@@ -1295,11 +1407,17 @@ void resolver::get_brute_angle(shot_t* shot)
 		return;
 
 	// Head bone — change index if your studio head bone differs
-	Vector resolved_head{
-		mat[8][0][3],
-		mat[8][1][3],
-		mat[8][2][3]
-	};
+	const auto model = player->get_model();
+	const auto hdr = model ? interfaces::model_info()->GetStudioModel(model) : nullptr;
+	const auto set = hdr ? hdr->pHitboxSet(player->get_hitbox_set()) : nullptr;
+	const auto hb = set ? set->pHitbox(HITBOX_HEAD) : nullptr;
+	if (!hb)
+		return;
+
+	Vector vmin, vmax;
+	math::vector_transform(hb->bbmin, mat[hb->bone], vmin);
+	math::vector_transform(hb->bbmax, mat[hb->bone], vmax);
+	const Vector resolved_head = (vmin + vmax) * 0.5f;
 
 	if (fabsf(server_pos.z - resolved_head.z) > 40.f)
 		return;
@@ -1376,15 +1494,15 @@ void resolver::calc_missed_shots(shot_t* shot)
 		else
 		{
 			util::print_dev_console(true, Color(100, 255, 100),
-				xorstr_("hit resolved shot - dir=%-10s bias=%+.2f var=%.3f safety=%d dmg=%d\n"),
-				dir_name, log.m_kalman.bias, log.m_kalman.variance, shot->safety, shot->damage);
+				xorstr_("hit resolved shot - dir=%-10s bias_fire=%+.2f bias_now=%+.2f var_fire=%.3f safety=%d dmg=%d\n"),
+				dir_name, shot->bias_at_fire, log.m_kalman.bias, shot->var_at_fire, shot->safety, shot->damage);
 		}
 	}
 	else if (shot->hit)
 	{
 		util::print_dev_console(true, Color(255, 80, 80),
-			xorstr_("missed shot due to resolver - dir=%-10s bias=%+.2f var=%.3f safety=%d dmg=%d\n"),
-			dir_name, log.m_kalman.bias, log.m_kalman.variance, shot->safety, shot->damage);
+			xorstr_("missed shot due to resolver - dir=%-10s bias_fire=%+.2f bias_now=%+.2f var_fire=%.3f safety=%d dmg=%d\n"),
+			dir_name, shot->bias_at_fire, log.m_kalman.bias, shot->var_at_fire, shot->safety, shot->damage);
 	}
 	else if (shot->hit_extrapolation)
 	{
