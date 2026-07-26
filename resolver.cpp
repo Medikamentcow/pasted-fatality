@@ -661,8 +661,8 @@ void resolver::yaw_resolve(const lag_record_t* record, const lag_record_t* previ
 	const bool strong_feet = !anim.is_moving && feet_delta_change > 40.f;
 	const bool extreme_desync = fabsf(anim.eye_feet_delta) > 105.f;
 	const bool lby_flip = anim.lby_snapped;
-
 	const bool pattern_break = strong_layer6 || strong_layer3 || strong_feet || extreme_desync || lby_flip;
+
 	if (!pattern_break)
 	{
 		if (interfaces::client_state()->get_last_server_tick() - log.m_last_flip_tick > time_to_ticks(1.1f))
@@ -670,16 +670,24 @@ void resolver::yaw_resolve(const lag_record_t* record, const lag_record_t* previ
 		return;
 	}
 
-	// Volatility for Kalman
-	log.m_kalman.variance = std::min(log.m_kalman.variance + 0.18f, 0.55f);
-	log.m_kalman.bias *= 0.85f;
+	// Only bleed confidence if enough time has passed since the last confirmed flip.
+	// This prevents walking targets from constantly eroding a well-converged filter.
+	const int  ticks_since_flip = interfaces::client_state()->get_last_server_tick() - log.m_last_flip_tick;
+	const bool allow_kalman_reset = ticks_since_flip > time_to_ticks(0.4f);
 
+	if (allow_kalman_reset)
+	{
+		log.m_kalman.variance = std::min(log.m_kalman.variance + 0.18f, 0.55f);
+		log.m_kalman.bias *= 0.85f;
+	}
+
+	// Mode-flip is unconditional — it's already gated by the confidence check,
+	// so it naturally no-ops when the filter is still confident after a short flip.
 	const float confidence = 1.f - std::clamp(log.m_kalman.variance, 0.f, 1.f);
 	if (confidence < 0.70f || fabsf(log.m_kalman.bias) < 0.40f)
 	{
 		const auto previous_mode = log.m_current_mode;
 		log.m_current_mode = static_cast<resolver_mode>(!static_cast<int>(log.m_current_mode));
-
 		if (previous_mode != log.m_current_mode)
 			log.m_last_flip_tick = interfaces::client_state()->get_last_server_tick();
 	}
@@ -786,26 +794,19 @@ void resolver::wall_detect(lag_record_t* record)
 		freestand_meas = (dmg_right - dmg_left) / total;
 		noise = 0.35f;
 
-		// ============ HEURISTIC: Asymmetric damage = strong bias signal ============
-		// If one side is heavily favored, nudge bias hard toward it
-		const float damage_ratio = std::max(dmg_left, dmg_right) / std::max(1.f, std::min(dmg_left, dmg_right));
-
-		if (damage_ratio > 2.5f)  // Strong asymmetry
-		{
-			noise *= 0.75f;  // Increase trust
-			const float strong_nudge = freestand_meas * 0.15f;
-			log.m_kalman.bias += strong_nudge;
-		}
-		else if (damage_ratio > 1.5f)  // Moderate asymmetry
-		{
+		// Asymmetric damage = strong bias signal — modulate noise only,
+		// no direct bias nudge (update_kalman handles the measurement below)
+		const float damage_ratio = std::max(dmg_left, dmg_right)
+			/ std::max(1.f, std::min(dmg_left, dmg_right));
+		if (damage_ratio > 2.5f)
+			noise *= 0.75f;
+		else if (damage_ratio > 1.5f)
 			noise *= 0.88f;
-			const float moderate_nudge = freestand_meas * 0.08f;
-			log.m_kalman.bias += moderate_nudge;
-		}
 	}
 
 	update_kalman(log, freestand_meas, noise);
 }
+
 
 void resolver::add_shot(shot_t& shot)
 {
@@ -1293,6 +1294,11 @@ void resolver::get_brute_angle(shot_t* shot)
 	const bool registered_miss = (shot->hit && !shot->hurt) || aimed_head_hit_body;
 	const bool no_registration = !shot->hit && !shot->hurt;
 
+	const bool is_spread = shot->m_miss_cause == miss_cause::spread;
+	const bool is_ambiguous = shot->m_miss_cause == miss_cause::ambiguous;
+	const bool is_resolver = shot->m_miss_cause == miss_cause::resolver
+		|| (registered_miss && aimed_head_hit_body); // head→body always resolver-like
+
 	// =========================================================================
 	// 1. Discrete Kalman update
 	// =========================================================================
@@ -1305,7 +1311,7 @@ void resolver::get_brute_angle(shot_t* shot)
 		case HITGROUP_CHEST:                                     hurt_noise = 0.06f; break;
 		case HITGROUP_STOMACH:                                   hurt_noise = 0.07f; break;
 		case HITGROUP_LEFTARM: case HITGROUP_RIGHTARM:
-		case HITGROUP_LEFTLEG: case HITGROUP_RIGHTLEG:           hurt_noise = 0.09f; break;
+		case HITGROUP_LEFTLEG: case HITGROUP_RIGHTLEG:           hurt_noise = 0.14f; break;
 		default:                                                 hurt_noise = 0.07f; break;
 		}
 
@@ -1316,33 +1322,33 @@ void resolver::get_brute_angle(shot_t* shot)
 	}
 	else if (registered_miss)
 	{
-		if (fabsf(tried_bias) >= 0.05f)
+		if (is_spread)
 		{
+			// Pure spread — do not touch bias or variance
+		}
+		else if (is_ambiguous && !aimed_head_hit_body)
+		{
+			// Unclear — keep bias, slight uncertainty only
+			log.m_kalman.variance = std::min(log.m_kalman.variance + 0.03f, 0.35f);
+		}
+		else if (fabsf(tried_bias) >= 0.05f)
+		{
+			// Clean resolver miss (or head→body)
 			const float commitment = 1.f - std::clamp(log.m_kalman.variance / 0.25f, 0.f, 1.f);
-			float miss_noise = aimed_head_hit_body
-				? 0.10f - commitment * 0.04f
-				: 0.08f - commitment * 0.02f;
+			float miss_noise = 0.14f - commitment * 0.06f;
 
 			if (was_extrapolated)
 				miss_noise *= 1.35f;
 
-			miss_noise = std::clamp(miss_noise, 0.06f, 0.40f);
-			update_kalman(log, -tried_bias, miss_noise);
+			miss_noise = std::clamp(miss_noise, 0.08f, 0.40f);
+			update_kalman(log, -tried_bias * 0.55f, miss_noise);
 		}
 	}
 	else // no_registration
 	{
-		if (fabsf(tried_bias) >= 0.05f)
-		{
-			const float commitment = 1.f - std::clamp(log.m_kalman.variance / 0.25f, 0.f, 1.f);
-			float noreg_noise = 0.25f - commitment * 0.10f;
-
-			if (was_extrapolated)
-				noreg_noise *= 1.35f;
-
-			noreg_noise = std::clamp(noreg_noise, 0.12f, 0.45f);
-			update_kalman(log, -tried_bias, noreg_noise);
-		}
+		// Very weak signal — variance only, no bias flip
+		if (fabsf(tried_bias) >= 0.05f && shot->hitchance >= 70.f)
+			log.m_kalman.variance = std::min(log.m_kalman.variance + 0.02f, 0.40f);
 	}
 
 	// =========================================================================
@@ -1353,11 +1359,17 @@ void resolver::get_brute_angle(shot_t* shot)
 		auto& bl = log.m_mode[mode].m_side[side].m_blacklist;
 		const float bias = log.m_kalman.bias;
 
-		if (registered_miss)
+		// Only blacklist on real resolver misses
+		if (registered_miss && is_resolver && !is_spread && !is_ambiguous)
 			bl[tried_dir] = true;
 
-		if (registered_hit)
+		if (registered_hit &&
+			(shot->hitinfo.hitgroup == HITGROUP_HEAD ||
+				shot->hitinfo.hitgroup == HITGROUP_CHEST ||
+				shot->hitinfo.hitgroup == HITGROUP_STOMACH))
+		{
 			bl[tried_dir] = false;
+		}
 
 		const float hysteresis = 0.35f;
 
@@ -1386,8 +1398,11 @@ void resolver::get_brute_angle(shot_t* shot)
 	// =========================================================================
 	// 4. Geometric backsolve
 	// =========================================================================
-	const bool resolve_miss = shot->hit && !shot->hurt;
-	if (!resolve_miss && !aimed_head_hit_body)
+	// Skip backsolve on spread/ambiguous client-misses — geometry isn't a side proof
+	const bool resolve_miss = shot->hit && !shot->hurt && is_resolver && !is_spread && !is_ambiguous;
+	const bool confirmed_head_hit = shot->hurt && shot->hitinfo.hitgroup == HITGROUP_HEAD;
+
+	if (!resolve_miss && !aimed_head_hit_body && !confirmed_head_hit)
 		return;
 
 	Vector server_pos{};
@@ -1406,7 +1421,6 @@ void resolver::get_brute_angle(shot_t* shot)
 	if (!mat)
 		return;
 
-	// Head bone — change index if your studio head bone differs
 	const auto model = player->get_model();
 	const auto hdr = model ? interfaces::model_info()->GetStudioModel(model) : nullptr;
 	const auto set = hdr ? hdr->pHitboxSet(player->get_hitbox_set()) : nullptr;
@@ -1438,11 +1452,16 @@ void resolver::get_brute_angle(shot_t* shot)
 	if (fabsf(lateral) < 2.5f)
 		return;
 
-	// Distance-aware scale (desync lever arm)
 	const float scale = std::clamp(0.5f * (12.f + len_res), 8.f, 16.f);
 	const float measurement = std::clamp(-lateral / scale, -1.f, 1.f);
 
-	float noise = aimed_head_hit_body ? 0.11f : 0.15f;
+	float noise;
+	if (confirmed_head_hit)
+		noise = 0.05f;
+	else if (aimed_head_hit_body)
+		noise = 0.11f;
+	else
+		noise = 0.15f;
 
 	if (shot->record.m_shot_info.hitchance >= 85.f)
 		noise *= 0.85f;
@@ -1450,7 +1469,7 @@ void resolver::get_brute_angle(shot_t* shot)
 	if (was_extrapolated)
 		noise *= 1.35f;
 
-	noise = std::clamp(noise, 0.08f, 0.40f);
+	noise = std::clamp(noise, 0.05f, 0.40f);
 
 	update_kalman(log, measurement, noise);
 }
@@ -1462,22 +1481,40 @@ void resolver::calc_missed_shots(shot_t* shot)
 
 	auto& log = player_log::get_log(shot->enemy_index);
 
-	// ---------- Direction name ----------
+	// ── Direction label ───────────────────────────────────────────────────────
 	const auto dir = shot->record.m_shot_dir;
 	const char* dir_name = "unknown";
 	switch (dir)
 	{
-	case resolver_direction::resolver_networked: dir_name = "networked"; break;
-	case resolver_direction::resolver_max:        dir_name = "max"; break;
-	case resolver_direction::resolver_zero:       dir_name = "zero"; break;
-	case resolver_direction::resolver_min:        dir_name = "min"; break;
-	case resolver_direction::resolver_max_extra:  dir_name = "max_extra"; break;
-	case resolver_direction::resolver_max_max:    dir_name = "max_max"; break;
-	case resolver_direction::resolver_min_min:    dir_name = "min_min"; break;
-	case resolver_direction::resolver_min_extra:  dir_name = "min_extra"; break;
+	case resolver_direction::resolver_networked:  dir_name = "networked";  break;
+	case resolver_direction::resolver_max:        dir_name = "max";        break;
+	case resolver_direction::resolver_zero:       dir_name = "zero";       break;
+	case resolver_direction::resolver_min:        dir_name = "min";        break;
+	case resolver_direction::resolver_max_extra:  dir_name = "max_extra";  break;
+	case resolver_direction::resolver_max_max:    dir_name = "max_max";    break;
+	case resolver_direction::resolver_min_min:    dir_name = "min_min";    break;
+	case resolver_direction::resolver_min_extra:  dir_name = "min_extra";  break;
 	}
 
-	// ---------- Main log line ----------
+	// ── Classify and stamp cause ──────────────────────────────────────────────
+	if (shot->hurt || shot->hit)
+	{
+		float lat = 0.f, vert = 0.f;
+		shot->m_miss_cause = classify_miss(shot, lat, vert);
+		shot->m_lat_err_deg = lat;
+		shot->m_vert_err_deg = vert;
+	}
+
+	const char* cause_str = "unknown";
+	switch (shot->m_miss_cause)
+	{
+	case miss_cause::resolver:  cause_str = "resolver";  break;
+	case miss_cause::spread:    cause_str = "spread";    break;
+	case miss_cause::ambiguous: cause_str = "ambiguous"; break;
+	default: break;
+	}
+
+	// ── Console output ────────────────────────────────────────────────────────
 	interfaces::cvar()->ConsoleColorPrintf(Color(235, 5, 90), xorstr_("[fatality] "));
 
 	if (shot->hurt)
@@ -1487,44 +1524,62 @@ void resolver::calc_missed_shots(shot_t* shot)
 
 		if (mismatch)
 		{
-			util::print_dev_console(true, Color(255, 150, 50),
-				xorstr_("mismatch due to resolver - dir=%-10s bias=%+.2f var=%.3f safety=%d dmg=%d\n"),
-				dir_name, log.m_kalman.bias, log.m_kalman.variance, shot->safety, shot->damage);
+			// Pick colour by cause so it's instantly readable in the console
+			const Color col = (shot->m_miss_cause == miss_cause::resolver) ? Color(255, 100, 50)
+				: (shot->m_miss_cause == miss_cause::spread) ? Color(180, 180, 255)
+				: Color(255, 200, 80);
+
+			util::print_dev_console(true, col,
+				xorstr_("mismatch [%s] - dir=%-10s bias=%+.2f var=%.3f hc=%.0f lat=%.1f vert=%.1f safety=%d dmg=%d\n"),
+				cause_str, dir_name,
+				log.m_kalman.bias, log.m_kalman.variance,
+				shot->hitchance, shot->m_lat_err_deg, shot->m_vert_err_deg,
+				shot->safety, shot->damage);
 		}
 		else
 		{
 			util::print_dev_console(true, Color(100, 255, 100),
 				xorstr_("hit resolved shot - dir=%-10s bias_fire=%+.2f bias_now=%+.2f var_fire=%.3f safety=%d dmg=%d\n"),
-				dir_name, shot->bias_at_fire, log.m_kalman.bias, shot->var_at_fire, shot->safety, shot->damage);
+				dir_name, shot->bias_at_fire, log.m_kalman.bias,
+				shot->var_at_fire, shot->safety, shot->damage);
 		}
 	}
 	else if (shot->hit)
 	{
-		util::print_dev_console(true, Color(255, 80, 80),
-			xorstr_("missed shot due to resolver - dir=%-10s bias_fire=%+.2f bias_now=%+.2f var_fire=%.3f safety=%d dmg=%d\n"),
-			dir_name, shot->bias_at_fire, log.m_kalman.bias, shot->var_at_fire, shot->safety, shot->damage);
+		const Color col = (shot->m_miss_cause == miss_cause::resolver) ? Color(255, 80, 80)
+			: (shot->m_miss_cause == miss_cause::spread) ? Color(180, 180, 255)
+			: Color(255, 200, 80);
+
+		util::print_dev_console(true, col,
+			xorstr_("missed [%s] - dir=%-10s bias_fire=%+.2f bias_now=%+.2f var_fire=%.3f hc=%.0f lat=%.1f vert=%.1f safety=%d\n"),
+			cause_str, dir_name,
+			shot->bias_at_fire, log.m_kalman.bias, shot->var_at_fire,
+			shot->hitchance, shot->m_lat_err_deg, shot->m_vert_err_deg,
+			shot->safety);
 	}
 	else if (shot->hit_extrapolation)
 	{
-		const char* reason = (!ConVar::cl_lagcompensation || !ConVar::cl_predict) ? "anti-exploit" : "extrapolation";
+		const char* reason = (!ConVar::cl_lagcompensation || !ConVar::cl_predict)
+			? "anti-exploit" : "extrapolation";
 		util::print_dev_console(true, Color(255, 140, 50),
-			xorstr_("missed shot due to %s - dir=%-10s bias=%+.2f var=%.3f safety=%d dmg=%d\n"),
-			reason, dir_name, log.m_kalman.bias, log.m_kalman.variance, shot->safety, shot->damage);
+			xorstr_("missed [%s] - dir=%-10s bias=%+.2f var=%.3f safety=%d\n"),
+			reason, dir_name,
+			log.m_kalman.bias, log.m_kalman.variance, shot->safety);
 	}
 	else if (shot->hit_originally)
 	{
 		util::print_dev_console(true, Color(255, 200, 50),
-			xorstr_("missed shot due to server correction - dir=%-10s bias=%+.2f var=%.3f safety=%d dmg=%d\n"),
-			dir_name, log.m_kalman.bias, log.m_kalman.variance, shot->safety, shot->damage);
+			xorstr_("missed [server correction] - dir=%-10s bias=%+.2f var=%.3f safety=%d\n"),
+			dir_name, log.m_kalman.bias, log.m_kalman.variance, shot->safety);
 	}
 	else
 	{
 		util::print_dev_console(true, Color(255, 180, 80),
-			xorstr_("missed shot due to spread - dir=%-10s bias=%+.2f var=%.3f safety=%d dmg=%d\n"),
-			dir_name, log.m_kalman.bias, log.m_kalman.variance, shot->safety, shot->damage);
+			xorstr_("missed [spread] - dir=%-10s bias=%+.2f var=%.3f safety=%d\n"),
+			dir_name, log.m_kalman.bias, log.m_kalman.variance, shot->safety);
 	}
 
-	// ---------- Dormant handling ----------
+	// ── Dormant handling ──────────────────────────────────────────────────────
 	if (shot->record.m_dormant)
 	{
 		if (shot->hurt)
@@ -1539,16 +1594,17 @@ void resolver::calc_missed_shots(shot_t* shot)
 			log.m_dormant_misses++;
 			interfaces::cvar()->ConsoleColorPrintf(Color(235, 5, 90), xorstr_("[fatality] "));
 			util::print_dev_console(true, Color(255, 100, 100),
-				xorstr_("missed shot due to dormant aimbot (total: %d)\n"), log.m_dormant_misses);
+				xorstr_("missed [dormant] (total: %d)\n"), log.m_dormant_misses);
 		}
 		return;
 	}
 
-	// ---------- Nospread pitch cycle ----------
-	if (shot->hurt && globals::nospread && shot->hitinfo.hitgroup == HITGROUP_HEAD && !shot->record.m_shot)
+	// ── Nospread pitch cycle ──────────────────────────────────────────────────
+	if (shot->hurt && globals::nospread &&
+		shot->hitinfo.hitgroup == HITGROUP_HEAD && !shot->record.m_shot)
 		log.nospread.m_pitch_cycle = 0;
 
-	// ---------- Early outs / bookkeeping ----------
+	// ── Bookkeeping ───────────────────────────────────────────────────────────
 	if (shot->hurt)
 		return;
 
@@ -1559,7 +1615,11 @@ void resolver::calc_missed_shots(shot_t* shot)
 		if (shot->record.m_unknown)
 			log.m_unknown_misses++;
 
-		log.m_shots++;
+		// Only count as a resolver miss if the classifier agrees
+		if (shot->m_miss_cause == miss_cause::resolver ||
+			shot->m_miss_cause == miss_cause::ambiguous)
+			log.m_shots++;
+
 		return;
 	}
 
