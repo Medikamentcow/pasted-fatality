@@ -370,6 +370,54 @@ void resolver::update_anim_info(player_log_t& log, lag_record_t* record, lag_rec
 		a.layer3_cycle_delta > 0.30f;
 }
 
+void resolver::on_flip_detected(player_log_t& log, const int current_tick)
+{
+	if (log.m_last_flip_tick > 0)
+	{
+		const int interval = current_tick - log.m_last_flip_tick;
+		if (interval >= 6 && interval <= 192)
+		{
+			log.m_flip_intervals[log.m_flip_interval_head] = interval;
+			log.m_flip_interval_head = (log.m_flip_interval_head + 1) % 5;
+			log.m_flip_interval_count = std::min(log.m_flip_interval_count + 1, 5);
+		}
+	}
+}
+
+void resolver::apply_flip_rhythm(player_log_t& log, const int current_tick)
+{
+	log.m_flip_imminent = false;  // always reset at the top
+
+	if (log.m_flip_interval_count < 3)
+		return;
+
+	float sum = 0.f, sum_sq = 0.f;
+	const int n = log.m_flip_interval_count;
+
+	for (int i = 0; i < n; ++i)
+		sum += static_cast<float>(log.m_flip_intervals[i]);
+
+	const float mean = sum / static_cast<float>(n);
+	log.m_flip_mean_interval = mean;  // cache for the archetype classifier
+
+	for (int i = 0; i < n; ++i)
+	{
+		const float d = static_cast<float>(log.m_flip_intervals[i]) - mean;
+		sum_sq += d * d;
+	}
+
+	// Only act on a regular cadence — high variance means irregular or jitter
+	if ((sum_sq / static_cast<float>(n)) > 6.f)
+		return;
+
+	const float ticks_since = static_cast<float>(current_tick - log.m_last_flip_tick);
+	const float ticks_to_next = mean - ticks_since;
+
+	// Flip is imminent — signal the dispatcher to pre-flip the committed direction
+	if (ticks_to_next >= 0.f && ticks_to_next < 4.f)
+		log.m_flip_imminent = true;
+}
+
 void resolver::yaw_resolve( const lag_record_t* record, const lag_record_t* previous )
 {
 	if ( record->m_shot || ( previous && previous->m_shot ) )
