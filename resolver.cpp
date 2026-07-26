@@ -279,6 +279,7 @@ void resolver::update_anim_info(player_log_t& log, lag_record_t* record, lag_rec
 		return;
 
 	auto& a = log.m_anim;
+	auto& j = log.m_jitter;
 	const auto& layers = record->m_layers;
 
 	// ----- stash previous -----
@@ -355,7 +356,7 @@ void resolver::update_anim_info(player_log_t& log, lag_record_t* record, lag_rec
 		a.velocity_yaw_delta = 0.f;
 	}
 
-	// ----- break flags (thresholds only — no resolve decision) -----
+	// ----- break flags -----
 	a.layer7_strafe_break =
 		a.layer7_weight > 0.50f ||
 		a.layer7_weight_delta > 0.25f ||
@@ -368,80 +369,150 @@ void resolver::update_anim_info(player_log_t& log, lag_record_t* record, lag_rec
 	a.layer3_break =
 		a.layer3_weight_delta > 0.35f ||
 		a.layer3_cycle_delta > 0.30f;
-}
 
-void resolver::on_flip_detected(player_log_t& log, const int current_tick)
-{
-	if (log.m_last_flip_tick > 0)
+	// =========================================================================
+	// Jitter / body-yaw sampling
+	// Use our own cycle/weight deltas — do NOT rely on m_flPrevCycle on records.
+	// =========================================================================
+	const bool whole_body_idle = a.layer12_weight < 0.25f;
+
+	// Strong commit: adjust layer moved hard or LBY feet snap
+	const bool l3_commit =
+		a.layer3_weight > 0.01f &&
+		(a.layer3_cycle_delta > 0.12f || a.layer3_weight_delta > 0.20f || a.layer3_break);
+
+	// Weaker standing desync sample so we still warm up without a perfect LBY event
+	const bool standing_desync_sample =
+		a.is_standing &&
+		a.standing_ticks >= 3 &&
+		whole_body_idle &&
+		fabsf(a.eye_feet_delta) > 12.f;
+
+	// Throttle weak samples so we don't flood EWMA every tick
+	static thread_local int s_last_weak_sample_tick[65]{};
+	const int idx = std::clamp(record->m_index, 0, 64);
+	const int cur_tick = interfaces::client_state()->get_last_server_tick();
+	const bool weak_ok =
+		standing_desync_sample &&
+		(cur_tick - s_last_weak_sample_tick[idx] >= 2);
+
+	const bool should_sample =
+		a.is_standing &&
+		whole_body_idle &&
+		((l3_commit || a.lby_snapped) || weak_ok);
+
+	if (should_sample)
 	{
-		const int interval = current_tick - log.m_last_flip_tick;
-		if (interval >= 6 && interval <= 192)
+		if (weak_ok && !(l3_commit || a.lby_snapped))
+			s_last_weak_sample_tick[idx] = cur_tick;
+
+		const float sample = a.eye_yaw;
+
+		if (j.sample_count == 0)
 		{
-			log.m_flip_intervals[log.m_flip_interval_head] = interval;
-			log.m_flip_interval_head = (log.m_flip_interval_head + 1) % 5;
-			log.m_flip_interval_count = std::min(log.m_flip_interval_count + 1, 5);
+			j.ewma = sample;
+			j.ewm_var = 0.f;
 		}
+		else
+		{
+			float delta = sample - j.ewma;
+			while (delta > 180.f)  delta -= 360.f;
+			while (delta < -180.f) delta += 360.f;
+
+			j.ewma += j.ALPHA * delta;
+			while (j.ewma > 180.f)  j.ewma -= 360.f;
+			while (j.ewma < -180.f) j.ewma += 360.f;
+
+			j.ewm_var = (1.f - j.ALPHA) * (j.ewm_var + j.ALPHA * delta * delta);
+		}
+
+		j.last_commit_yaw = sample;
+		j.last_commit_tick = cur_tick;
+		j.sample_count = std::min(j.sample_count + 1, 64);
+
+		// Keep confidence partially fresh even before yaw_resolve runs
+		const float var_conf = 1.f - clamp(
+			(j.ewm_var - j.VAR_LOW) / (j.VAR_HIGH - j.VAR_LOW),
+			0.f, 1.f);
+		j.confidence = var_conf; // recency applied fully in yaw_resolve
 	}
 }
 
-void resolver::apply_flip_rhythm(player_log_t& log, const int current_tick)
+void resolver::yaw_resolve(const lag_record_t* record, const lag_record_t* previous)
 {
-	log.m_flip_imminent = false;  // always reset at the top
-
-	if (log.m_flip_interval_count < 3)
+	if (record->m_shot || (previous && previous->m_shot))
 		return;
 
-	float sum = 0.f, sum_sq = 0.f;
-	const int n = log.m_flip_interval_count;
+	auto& log = player_log::get_log(record->m_index);
+	auto& j = log.m_jitter;
 
-	for (int i = 0; i < n; ++i)
-		sum += static_cast<float>(log.m_flip_intervals[i]);
-
-	const float mean = sum / static_cast<float>(n);
-	log.m_flip_mean_interval = mean;  // cache for the archetype classifier
-
-	for (int i = 0; i < n; ++i)
-	{
-		const float d = static_cast<float>(log.m_flip_intervals[i]) - mean;
-		sum_sq += d * d;
-	}
-
-	// Only act on a regular cadence — high variance means irregular or jitter
-	if ((sum_sq / static_cast<float>(n)) > 6.f)
-		return;
-
-	const float ticks_since = static_cast<float>(current_tick - log.m_last_flip_tick);
-	const float ticks_to_next = mean - ticks_since;
-
-	// Flip is imminent — signal the dispatcher to pre-flip the committed direction
-	if (ticks_to_next >= 0.f && ticks_to_next < 4.f)
-		log.m_flip_imminent = true;
-}
-
-void resolver::yaw_resolve( const lag_record_t* record, const lag_record_t* previous )
-{
-	if ( record->m_shot || ( previous && previous->m_shot ) )
-		return;
-
-	auto& log = player_log::get_log( record->m_index );
-
-	const auto delta = !previous ? 0.f : math::normalize_float( record->m_eye_angles.y - previous->m_eye_angles.y );
+	// ── delta-based mode baseline ─────────────────────────────────────────────
+	const auto delta = !previous
+		? 0.f
+		: math::normalize_float(record->m_eye_angles.y - previous->m_eye_angles.y);
 
 	const auto use_nonflip = delta < -30.f;
 	const auto use_flip = delta > 30.f;
 
 	const auto previous_mode = log.m_current_mode;
 
-	if ( ( log.m_current_mode == resolver_mode::resolver_flip && use_nonflip || log.m_current_mode == resolver_mode::resolver_default && use_flip ) )
-		log.m_current_mode = static_cast< resolver_mode >( !static_cast< int >( log.m_current_mode ) );
-	else if ( fabsf( delta ) > 170.f )
-		log.m_current_mode = static_cast< resolver_mode >( !static_cast< int >( log.m_current_mode ) );
+	if ((log.m_current_mode == resolver_mode::resolver_flip && use_nonflip)
+		|| (log.m_current_mode == resolver_mode::resolver_default && use_flip))
+		log.m_current_mode = static_cast<resolver_mode>(!static_cast<int>(log.m_current_mode));
+	else if (fabsf(delta) > 170.f)
+		log.m_current_mode = static_cast<resolver_mode>(!static_cast<int>(log.m_current_mode));
 
-	if ( previous_mode != log.m_current_mode )
+	if (previous_mode != log.m_current_mode)
 		log.m_last_flip_tick = interfaces::client_state()->get_last_server_tick();
 
-	if ( interfaces::client_state()->get_last_server_tick() - log.m_last_flip_tick > time_to_ticks( 1.1f ) )
+	if (interfaces::client_state()->get_last_server_tick() - log.m_last_flip_tick > time_to_ticks(1.1f))
 		log.m_current_mode = resolver_mode::resolver_default;
+
+	// ── jitter distribution side override ────────────────────────────────────
+	// wall_detect resolved a side from geometry — higher confidence than stats
+	if (log.m_wall_side_valid)
+		return;
+
+	// need a warm sample set before the distribution is meaningful
+	if (j.sample_count < j.MIN_SAMPLES)
+		return;
+
+	const int ticks_since = interfaces::client_state()->get_last_server_tick() - j.last_commit_tick;
+
+	// variance confidence: tight clustering → high, wide spread → low
+	const float var_conf = 1.f - clamp(
+		(j.ewm_var - j.VAR_LOW) / (j.VAR_HIGH - j.VAR_LOW),
+		0.f, 1.f
+	);
+
+	// recency confidence: decays linearly, floors at 0.1 so old data still weakly votes
+	const float recency_conf = 1.f - clamp(
+		static_cast<float>(ticks_since) / static_cast<float>(j.COMMIT_FRESH_TICKS),
+		0.f, 1.f
+	);
+
+	j.confidence = var_conf * std::max(recency_conf, 0.1f);
+
+	if (j.confidence < j.CONFIDENCE_GATE)
+		return;
+
+	// lerp from the last committed body yaw toward the long-run mean as the commit ages
+	const float blend_t = clamp(
+		static_cast<float>(ticks_since) / static_cast<float>(j.COMMIT_FRESH_TICKS),
+		0.f, 1.f
+	);
+	const float body_yaw = math::lerp(j.last_commit_yaw, j.ewma, blend_t);
+
+	// signed arc: positive → eye is left of body → body is to the right
+	const float offset = math::angle_diff(record->m_eye_angles.y, body_yaw);
+
+	constexpr float DEADZONE = 5.f;
+	if (std::fabsf(offset) < DEADZONE)
+		return;
+
+	log.m_current_side = (offset > 0.f)
+		? resolver_side::resolver_right
+		: resolver_side::resolver_left;
 }
 
 void resolver::on_createmove()
@@ -475,136 +546,79 @@ void resolver::on_createmove()
 	last_eyepos = eyepos;
 }
 
-void resolver::wall_detect( lag_record_t* record )
+void resolver::wall_detect(lag_record_t* record)
 {
-	auto& log = player_log::get_log( record->m_index );
-
-	const auto should_change_desync = !record->m_shot && log.m_unknown && !record->m_did_wall_detect && record->m_lagamt >= 1;
+	auto& log = player_log::get_log(record->m_index);
+	const auto player = globals::get_player(record->m_index);
+	if (!player)
+		return;
 
 	const auto weapon = local_weapon;
-	if ( !weapon || !weapon->is_gun() )
-		return;
-
-	const auto player = globals::get_player( record->m_index );
-
-	const auto hdr = player->get_model_ptr();
-	if ( !hdr )
-		return;
-
-	const auto studio_hdr = hdr->m_pStudioHdr;
-	if ( !studio_hdr )
-		return;
-
-	const auto hitbox_set = studio_hdr->pHitboxSet( player->get_hitbox_set() );
-	if ( !hitbox_set )
-		return;
-
-	const auto hitbox = hitbox_set->pHitbox( HITBOX_HEAD );
-	if ( !hitbox )
+	if (!weapon || !weapon->is_gun())
 		return;
 
 	record->m_did_wall_detect = true;
+	log.m_wall_side_valid = false;
 
-	auto get_rotated_pos = [] ( Vector start, const float rotation, const float distance )
+	const Vector eye_pos = record->m_origin + Vector(0.f, 0.f, 64.f);
+	const Vector target = current_eye;
+	const float yaw = math::calc_angle(eye_pos, target).y;
+
+	auto get_rotated = [](Vector start, float rotation, float dist) -> Vector
+		{
+			const float rad = DEG2RAD(rotation);
+			start.x += cosf(rad) * dist;
+			start.y += sinf(rad) * dist;
+			return start;
+		};
+
+	const Vector local_left = get_rotated(eye_pos, math::normalize_float(yaw - 90.f), 18.f);
+	const Vector local_right = get_rotated(eye_pos, math::normalize_float(yaw + 90.f), 18.f);
+
+	auto get_damage = [&](const Vector& from, const Vector& to) -> float
+		{
+			aimbot::aimpoint_t point{};
+			point.point = to;
+			auto pen = *interfaces::weapon_system()->GetWpnData(WEAPON_AWP);
+			pen.idamage = 200;
+			can_hit(player, penetration::pen_data({}, {}, {}, {}, &pen), from, &point, point.damage);
+			return static_cast<float>(point.damage);
+		};
+
+	const float dmg_left = get_damage(local_left, target);
+	const float dmg_right = get_damage(local_right, target);
+
+	resolver_side new_side = log.m_current_side;
+	bool decisive = false;
+
+	if (dmg_left > 0.f && dmg_right <= 0.f)
 	{
-		const auto rad = DEG2RAD( rotation );
-		start.x += cos( rad ) * distance;
-		start.y += sin( rad ) * distance;
-
-		return start;
-	};
-
-
-	const auto eye_pos = record->m_origin + Vector( 0.f, 0.f, 60.f );
-	const auto target_position = current_eye;
-	const auto target_angle = math::calc_angle( eye_pos, target_position );
-
-	const auto weapon_info = interfaces::weapon_system()->GetWpnData( WEAPON_AWP );
-
-	const auto local_pos_left = get_rotated_pos( eye_pos, math::normalize_float( target_angle.y - 90.f ), 25.f );
-	const auto local_pos_right = get_rotated_pos( eye_pos, math::normalize_float( target_angle.y + 90.f ), 25.f );
-
-	const auto local_half_pos_left = get_rotated_pos( eye_pos, math::normalize_float( target_angle.y - 90.f ), 12.f );
-	const auto local_half_pos_right = get_rotated_pos( eye_pos, math::normalize_float( target_angle.y + 90.f ), 12.f );
-
-	const auto enemy_pos_left = get_rotated_pos( target_position, math::normalize_float( target_angle.y - 90.f ), 25.f );
-	const auto enemy_pos_right = get_rotated_pos( target_position, math::normalize_float( target_angle.y + 90.f ), 25.f );
-
-	const auto compare = [&player, &weapon_info] ( const Vector& from_left, const Vector& from_right, const Vector& left, const Vector& right, const bool check = false ) -> int
-	{
-		auto pen_weapon = *weapon_info;
-		if ( !check )
-			pen_weapon.idamage = 200;
-
-		aimbot::aimpoint_t aimpoint_left{};
-		aimpoint_left.point = left;
-		can_hit( player, penetration::pen_data( {}, {}, {}, {}, &pen_weapon ), from_left, &aimpoint_left, aimpoint_left.damage );
-
-		if ( check )
-			return aimpoint_left.damage > 0;
-
-		aimbot::aimpoint_t aimpoint_right{};
-		aimpoint_right.point = right;
-		can_hit( player, penetration::pen_data( {}, {}, {}, {}, &pen_weapon ), from_right, &aimpoint_right, aimpoint_right.damage );
-
-		if ( !aimpoint_left.damage && aimpoint_right.damage )
-			return 1;
-
-		if ( !aimpoint_right.damage && aimpoint_left.damage )
-			return 2;
-
-		return 0;
-	};
-
-
-	auto goal_dir = -1;
-
-	if ( const auto res = compare( local_pos_left, local_pos_right, enemy_pos_left, enemy_pos_right ); res && !compare( eye_pos, eye_pos, res == 1 ? enemy_pos_left : enemy_pos_right, enemy_pos_right, true ) )
-	{
-		goal_dir = res == 1 ? 1 : 2;
+		new_side = resolver_side::resolver_left;
+		decisive = true;
 	}
-	else if ( const auto res = compare( local_pos_left, local_pos_right, enemy_pos_right, enemy_pos_left ); res && !compare( eye_pos, eye_pos, res == 1 ? enemy_pos_left : enemy_pos_right, enemy_pos_right, true ) )
+	else if (dmg_right > 0.f && dmg_left <= 0.f)
 	{
-		goal_dir = res == 1 ? 1 : 2;
+		new_side = resolver_side::resolver_right;
+		decisive = true;
+	}
+	else if (dmg_left > dmg_right * 1.35f)
+	{
+		new_side = resolver_side::resolver_left;
+		decisive = true;
+	}
+	else if (dmg_right > dmg_left * 1.35f)
+	{
+		new_side = resolver_side::resolver_right;
+		decisive = true;
 	}
 
-	if ( goal_dir != -1 && compare( goal_dir == 1 ? local_half_pos_left : local_half_pos_right, target_position, target_position, target_position, true ) )
-	{
-		goal_dir = -1;
-	}
-
-	if ( goal_dir == -1 )
+	if (!decisive)
 		return;
 
-	log.m_wall_detect_ang = math::normalize_float( target_angle.y + ( goal_dir == 1 ? -90.f : 90.f ) );
-
-	auto closest_state = resolver_direction::resolver_invalid;
-
-	if ( should_change_desync )
-	{
-		record->setup_matrices();
-
-		auto closest_angle = FLT_MAX;
-		for ( auto i = resolver_direction::resolver_networked; i < resolver_direction::resolver_max_extra; i++ )
-		{
-			auto& state = record->m_state[ i ];
-
-			const auto pos = Vector( state.m_matrix[ hitbox->bone ][ 0 ][ 3 ], state.m_matrix[ hitbox->bone ][ 1 ][ 3 ], state.m_matrix[ hitbox->bone ][ 2 ][ 3 ] );
-			const auto angle = math::calc_angle( record->m_origin, pos );
-			const auto diff = fabsf( math::normalize_float( angle.y - log.m_wall_detect_ang ) );
-			if ( diff < closest_angle )
-			{
-				closest_angle = diff;
-				closest_state = i;
-			}
-		}
-	}
-
-	log.m_current_side = goal_dir == 1 ? resolver_side::resolver_left : resolver_side::resolver_right;
-
-	if ( closest_state != resolver_direction::resolver_invalid )
-		log.m_mode[ log.m_current_mode ].m_side[ log.m_current_side ].m_current_dir = closest_state;
-
+	log.m_current_side = new_side;
+	log.m_wall_side_valid = true;
+	log.m_wall_detect_ang = math::normalize_float(
+		yaw + (new_side == resolver_side::resolver_left ? -90.f : 90.f));
 }
 
 void resolver::add_shot( shot_t& shot )
@@ -1242,63 +1256,133 @@ void resolver::get_brute_angle( shot_t* shot )
 	}
 }
 
-void resolver::calc_missed_shots( shot_t* shot )
+void resolver::calc_missed_shots(shot_t* shot)
 {
-	const auto log = &player_log::get_log( shot->enemy_index );
-	if ( shot->record.m_dormant )
-	{
-		if ( shot->hurt )
+	if (!shot)
+		return;
+
+	auto& log = player_log::get_log(shot->enemy_index);
+
+	const auto dir_name = [](resolver_direction d) -> const char*
 		{
-			const auto sound_player = sound_esp::get_sound_player( shot->enemy_index );
+			switch (d)
+			{
+			case resolver_direction::resolver_networked: return "networked";
+			case resolver_direction::resolver_max:        return "max";
+			case resolver_direction::resolver_zero:       return "zero";
+			case resolver_direction::resolver_min:        return "min";
+			case resolver_direction::resolver_max_extra:  return "max_extra";
+			case resolver_direction::resolver_max_max:    return "max_max";
+			case resolver_direction::resolver_min_min:    return "min_min";
+			case resolver_direction::resolver_min_extra:  return "min_extra";
+			default:                                      return "unknown";
+			}
+		};
+
+	const auto side_name = [](resolver_side s) -> const char*
+		{
+			switch (s)
+			{
+			case resolver_side::resolver_left:  return "left";
+			case resolver_side::resolver_right: return "right";
+			default:                            return "invalid";
+			}
+		};
+
+	const auto mode_name = [](resolver_mode m) -> const char*
+		{
+			switch (m)
+			{
+			case resolver_mode::resolver_default: return "default";
+			case resolver_mode::resolver_flip:    return "flip";
+			case resolver_mode::resolver_shot:    return "shot";
+			default:                              return "invalid";
+			}
+		};
+
+	const auto dir = shot->record.m_shot_dir;
+	const auto side = shot->record.m_resolver_side;
+	const auto mode = shot->record.m_resolver_mode;
+
+	// ----- Dormant -----
+	if (shot->record.m_dormant)
+	{
+		if (shot->hurt)
+		{
+			const auto sound_player = sound_esp::get_sound_player(shot->enemy_index);
 			sound_player->last_update_tick = interfaces::client_state()->get_last_server_tick();
 			sound_player->updated = true;
-			log->m_dormant_misses = 0;
+			log.m_dormant_misses = 0;
 		}
 		else
 		{
-			log->m_dormant_misses++;
-			interfaces::cvar()->ConsoleColorPrintf( Color( 235, 5, 90, 255 ), xorstr_( "[fatality] " ) );
-			util::print_dev_console( true, Color( 255, 255, 255, 255 ), xorstr_( "miss due to dormant aimbot\n" ) );
+			log.m_dormant_misses++;
+			interfaces::cvar()->ConsoleColorPrintf(Color(235, 5, 90), xorstr_("[fatality] "));
+			util::print_dev_console(true, Color(255, 100, 100),
+				xorstr_("missed dormant (total: %d)\n"), log.m_dormant_misses);
 		}
 		return;
 	}
 
-	if ( shot->hurt && globals::nospread && shot->hitinfo.hitgroup == HITGROUP_HEAD && !shot->record.m_shot )
-		log->nospread.m_pitch_cycle = 0;
+	if (shot->hurt && globals::nospread && shot->hitinfo.hitgroup == HITGROUP_HEAD && !shot->record.m_shot)
+		log.nospread.m_pitch_cycle = 0;
 
-	const auto player = globals::get_player( shot->enemy_index );
+	interfaces::cvar()->ConsoleColorPrintf(Color(235, 5, 90), xorstr_("[fatality] "));
 
-	if ( shot->hurt )
-		return;
-
-	if ( shot->hit && player && player->get_alive() )
+	// ----- Hit -----
+	if (shot->hurt)
 	{
-		if ( shot->record.m_unknown )
-			log->m_unknown_misses++;
-
-		log->m_shots++;
+		util::print_dev_console(true, Color(100, 255, 100),
+			xorstr_("hit - dir=%-10s side=%-5s mode=%-7s safety=%d dmg=%d hc=%.0f jitter_n=%d conf=%.2f\n"),
+			dir_name(dir),
+			side_name(side),
+			mode_name(mode),
+			shot->safety,
+			shot->hitinfo.damage > 0 ? shot->hitinfo.damage : shot->damage,
+			shot->hitchance,
+			log.m_jitter.sample_count,
+			log.m_jitter.confidence);
+		return;
 	}
 
+	// ----- Client hit, server miss (resolve) -----
+	if (shot->hit)
+	{
+		if (shot->record.m_unknown)
+			log.m_unknown_misses++;
+		log.m_shots++;
 
-	if ( shot->hit )
+		util::print_dev_console(true, Color(255, 80, 80),
+			xorstr_("miss resolve - dir=%-10s side=%-5s mode=%-7s safety=%d dmg=%d hc=%.0f jitter_n=%d conf=%.2f\n"),
+			dir_name(dir),
+			side_name(side),
+			mode_name(mode),
+			shot->safety,
+			shot->damage,
+			shot->hitchance,
+			log.m_jitter.sample_count,
+			log.m_jitter.confidence);
 		return;
+	}
 
-	log->m_shots_spread++;
+	// ----- No client registration -----
+	log.m_shots_spread++;
 
-	_( fatality, "FATALITY " );
-	_( missed, "miss due to spread\n" );
-	_( missed2, "miss due to server correction\n" );
-	_( missed3, "miss due to extrapolation\n" );
-	_( missed3_2, "miss due to anti-exploit\n" );
+	const char* reason = "spread";
+	if (shot->hit_extrapolation)
+		reason = (!ConVar::cl_lagcompensation || !ConVar::cl_predict) ? "anti-exploit" : "extrapolation";
+	else if (shot->hit_originally)
+		reason = "server correction";
 
-	interfaces::cvar()->ConsoleColorPrintf( Color( 235, 5, 90, 255 ), fatality.c_str() );
-
-	if ( shot->hit_extrapolation )
-		util::print_dev_console( true, Color( 255, 255, 255, 255 ), ( !ConVar::cl_lagcompensation || !ConVar::cl_predict ) ? missed3_2.c_str() : missed3.c_str() );
-	else if ( shot->hit_originally )
-		util::print_dev_console( true, Color( 255, 255, 255, 255 ), missed2.c_str() );
-	else
-		util::print_dev_console( true, Color( 255, 255, 255, 255 ), missed.c_str() );
+	util::print_dev_console(true, Color(255, 180, 80),
+		xorstr_("miss %s - dir=%-10s side=%-5s mode=%-7s safety=%d dmg=%d hc=%.0f\n"),
+		reason,
+		dir_name(dir),
+		side_name(side),
+		mode_name(mode),
+		shot->safety,
+		shot->damage,
+		shot->hitchance);
 }
 
 void resolver::set_local_info()
