@@ -15,37 +15,58 @@ void resolver::resolve( C_CSPlayer* player, lag_record_t* record, lag_record_t* 
 	yaw_resolve( record, previous );
 }
 
-void resolver::post_animate( C_CSPlayer* player, lag_record_t* record )
+void resolver::post_animate(C_CSPlayer* player, lag_record_t* record)
 {
-	const auto log = &player_log::get_log( player->EntIndex() );
+	const auto log = &player_log::get_log(player->EntIndex());
 
-	if ( vars::aim.resolver_mode->get<int>() )
-		for ( auto& mode : log->m_mode )
-			for ( auto& side : mode.m_side )
-				if ( side.m_current_dir > resolver_direction::resolver_max )
+	// Only strip extras when resolver_mode limits the set.
+	// Enum order: networked(0), max(1), zero(2), min(3), max_extra(4), ...
+	// Do NOT use "> resolver_max" — that incorrectly wipes min/zero.
+	if (vars::aim.resolver_mode->get<int>())
+	{
+		for (auto& mode : log->m_mode)
+		{
+			for (auto& side : mode.m_side)
+			{
+				if (side.m_current_dir >= resolver_direction::resolver_max_extra)
 				{
 					side.m_current_dir = resolver_direction::resolver_networked;
 					log->m_unknown_shot = true;
 					log->m_unknown = true;
 				}
+			}
+		}
+	}
 
-	if ( !player->is_enemy() || player->get_player_info().fakeplayer )
-		log->m_mode[ resolver_mode::resolver_shot ].m_side = log->m_mode[ resolver_mode::resolver_default ].m_side = log->m_mode[ resolver_mode::resolver_flip ].m_side = {};
+	if (!player->is_enemy() || player->get_player_info().fakeplayer)
+	{
+		log->m_mode[resolver_mode::resolver_shot].m_side =
+			log->m_mode[resolver_mode::resolver_default].m_side =
+			log->m_mode[resolver_mode::resolver_flip].m_side = {};
+	}
 
 	record->m_resolver_mode = record->m_shot ? resolver_mode::resolver_shot : log->m_current_mode;
 	record->m_resolver_side = log->m_current_side;
 
-	if ( !record->m_shot )
+	if (!record->m_shot)
 	{
 		const auto cureye = record->m_eye_angles;
-		if ( fabsf( cureye.x ) >= 60.f )
+		if (fabsf(cureye.x) >= 60.f)
 			log->m_last_unusual_pitch = interfaces::globals()->curtime;
 		else
 			log->m_last_zero_pitch = interfaces::globals()->curtime;
 	}
 
-	if ( log->m_unknown_shot && log->m_mode[ log->m_current_mode ].m_side[ log->m_current_side ].m_current_dir > resolver_direction::resolver_networked )
-		log->m_mode[ resolver_mode::resolver_shot ].m_side[ log->m_current_side ].m_current_dir = log->m_mode[ log->m_current_mode ].m_side[ log->m_current_side ].m_current_dir;
+	// Copy resolved dir into shot-mode slot when still unknown on shots
+	const auto& live_dir =
+		log->m_mode[log->m_current_mode].m_side[log->m_current_side].m_current_dir;
+
+	if (log->m_unknown_shot && live_dir > resolver_direction::resolver_networked)
+	{
+		log->m_mode[resolver_mode::resolver_shot]
+			.m_side[log->m_current_side]
+			.m_current_dir = live_dir;
+	}
 }
 
 bool resolver::extrapolate_record( int ticks, lag_record_t& outrecord, const bool simple )
@@ -422,7 +443,7 @@ void resolver::update_anim_info(player_log_t& log, lag_record_t* record, lag_rec
 				if (cur_sign != j.last_delta_sign)
 					j.sign_flip_count++;
 				else
-					j.sign_flip_count = std::max(0, j.sign_flip_count - 1);
+					j.sign_flip_count = std::max(0, j.sign_flip_count - 2);
 			}
 			if (cur_sign != 0)
 				j.last_delta_sign = cur_sign;
@@ -439,18 +460,7 @@ void resolver::update_anim_info(player_log_t& log, lag_record_t* record, lag_rec
 		j.last_commit_yaw = sample;
 		j.last_commit_tick = cur_tick;
 		j.sample_count = std::min(j.sample_count + 1, 64);
-
-		if (!j.is_bimodal)
-		{
-			const float var_conf = 1.f - clamp(
-				(j.ewm_var - j.VAR_LOW) / (j.VAR_HIGH - j.VAR_LOW),
-				0.f, 1.f);
-			j.confidence = var_conf;
-		}
-		else
-		{
-			j.confidence = std::min(1.f, 0.45f + 0.1f * static_cast<float>(j.sign_flip_count));
-		}
+		// confidence is computed only in yaw_resolve
 	}
 }
 
@@ -531,12 +541,13 @@ void resolver::yaw_resolve(const lag_record_t* record, const lag_record_t* previ
 			const float diff_hi = fabsf(math::angle_diff(record->m_eye_angles.y, cluster_hi));
 			const float diff_lo = fabsf(math::angle_diff(record->m_eye_angles.y, cluster_lo));
 
+			// Far cluster (aggressive; wrong on near-cluster ticks by design)
 			body_yaw = (diff_hi > diff_lo) ? cluster_hi : cluster_lo;
 
 			j.confidence = std::min(1.f, 0.45f + 0.1f * static_cast<float>(j.sign_flip_count))
 				* std::max(recency_conf, 0.1f);
 
-			can_use = j.sign_flip_count >= 3 && recency_conf > 0.15f;
+			can_use = recency_conf > 0.15f;
 		}
 		else
 		{
@@ -569,7 +580,7 @@ void resolver::yaw_resolve(const lag_record_t* record, const lag_record_t* previ
 		}
 	}
 
-	// 2c. Eye / feet (and move blend)
+	// 2c. Eye / feet
 	if (!side_set)
 	{
 		float side_signal = a.eye_feet_delta;
@@ -587,7 +598,7 @@ void resolver::yaw_resolve(const lag_record_t* record, const lag_record_t* previ
 	}
 
 	// =========================================================================
-	// 3. DIR — min/max + blacklist
+	// 3. DIR
 	// =========================================================================
 	auto& slot = log.m_mode[log.m_current_mode].m_side[log.m_current_side];
 
@@ -596,7 +607,7 @@ void resolver::yaw_resolve(const lag_record_t* record, const lag_record_t* previ
 		? resolver_direction::resolver_min
 		: resolver_direction::resolver_max;
 
-	if (fabsf(a.eye_feet_delta) > 25.f)
+	if (a.is_standing && fabsf(a.eye_feet_delta) > 25.f)
 	{
 		picked = (a.eye_feet_delta < 0.f)
 			? resolver_direction::resolver_min
@@ -1153,208 +1164,131 @@ void resolver::approve_shots( const ClientFrameStage_t& stage )
 	current_hitposes.clear();
 }
 
-void resolver::get_brute_angle( shot_t* shot )
+void resolver::get_brute_angle(shot_t* shot)
 {
-	if ( !local_player || !local_player->get_alive() || !local_weapon || shot->record.m_dormant )
+	if (!local_player || !local_player->get_alive() || !local_weapon || !shot || shot->record.m_dormant)
 		return;
 
-	const auto player = globals::get_player( shot->enemy_index );
-	if ( !player || !player->get_alive() )
+	const auto player = globals::get_player(shot->enemy_index);
+	if (!player || !player->get_alive() || player->get_player_info().fakeplayer)
 		return;
 
-	const auto hdr = player->get_model_ptr();
-	if ( !hdr )
+	if (vars::legit_enabled())
 		return;
 
-	const auto studio_hdr = hdr->m_pStudioHdr;
-	if ( !studio_hdr )
+	auto& log = player_log::get_log(shot->enemy_index);
+
+	const auto mode = shot->record.m_shot
+		? resolver_mode::resolver_shot
+		: shot->record.m_resolver_mode;
+	const auto side = shot->record.m_resolver_side;
+	auto& slot = log.m_mode[mode].m_side[side];
+
+	const auto tried = shot->record.m_shot_dir;
+
+	const bool resolve_miss = shot->hit && !shot->hurt;
+	const bool registered_hit = shot->hurt;
+
+	// Spread / no registration — leave anim resolve alone
+	if (!resolve_miss && !registered_hit)
 		return;
 
-	const auto hitbox_set = studio_hdr->pHitboxSet( player->get_hitbox_set() );
-	if ( !hitbox_set )
-		return;
+	auto is_min_family = [](resolver_direction d) -> bool
+		{
+			return d == resolver_direction::resolver_min
+				|| d == resolver_direction::resolver_min_extra
+				|| d == resolver_direction::resolver_min_min;
+		};
 
-	const auto hitbox = hitbox_set->pHitbox( HITBOX_HEAD );
-	if ( !hitbox )
-		return;
+	auto is_max_family = [](resolver_direction d) -> bool
+		{
+			return d == resolver_direction::resolver_max
+				|| d == resolver_direction::resolver_max_extra
+				|| d == resolver_direction::resolver_max_max;
+		};
 
-	const auto log = &player_log::get_log( shot->enemy_index );
+	auto pick_opposite_primary = [&](resolver_direction from) -> resolver_direction
+		{
+			// Prefer plain min/max; only step to extras if primaries are blocked
+			const resolver_direction primary =
+				is_min_family(from) ? resolver_direction::resolver_max
+				: is_max_family(from) ? resolver_direction::resolver_min
+				: (side == resolver_side::resolver_left
+					? resolver_direction::resolver_max
+					: resolver_direction::resolver_min);
 
-	if ( vars::aim.resolver_mode->get<int>() )
-		for ( auto& mode : log->m_mode )
-			for ( auto& side : mode.m_side )
-				if ( side.m_current_dir > resolver_direction::resolver_max )
-				{
-					side.m_current_dir = resolver_direction::resolver_networked;
-					log->m_unknown_shot = true;
-					log->m_unknown = true;
-				}
+			if (!slot.m_blacklist[primary])
+				return primary;
 
-	const auto use_front = shot->record.m_shot_info.extrapolated && !log->record.empty() && !log->record.back().m_dormant;
-	const auto target_record = use_front ? &log->record.back() : &shot->record;
-	if ( use_front )
-		target_record->setup_matrices();
+			const resolver_direction extra =
+				(primary == resolver_direction::resolver_max)
+				? resolver_direction::resolver_max_extra
+				: resolver_direction::resolver_min_extra;
 
-	const auto state = shot->record.m_shot_dir;
-	const auto current_mode = target_record->m_shot ? resolver_mode::resolver_shot : shot->record.m_resolver_mode;
-	const auto current_side = shot->record.m_resolver_side;
+			if (!slot.m_blacklist[extra]
+				&& (!vars::aim.resolver_mode->get<int>() || extra < resolver_direction::resolver_max_extra))
+				return extra;
 
-	const auto cureye = shot->record.m_eye_angles;
-	const auto legit = fabsf( cureye.x ) < 60.f && ( shot->record.m_lagamt < 4 || shot->record.m_lagamt > 18 ) && !shot->record.m_shot && log->m_unknown;
+			// Last resort: anything not blacklisted in the opposite family
+			const resolver_direction begin =
+				(primary == resolver_direction::resolver_max)
+				? resolver_direction::resolver_max
+				: resolver_direction::resolver_min;
+			const resolver_direction end =
+				(primary == resolver_direction::resolver_max)
+				? resolver_direction::resolver_max_max
+				: resolver_direction::resolver_min_extra;
 
-	Vector shot_dir = {};
-	const auto shot_angle = math::calc_angle( shot->shotpos, shot->hitpos );
-	math::angle_vectors( shot_angle, &shot_dir );
+			for (auto d = begin; d <= end; d = static_cast<resolver_direction>(static_cast<int>(d) + 1))
+			{
+				if (!slot.m_blacklist[d])
+					return d;
+			}
 
-	const auto end = shot->hitpos + shot_dir * 15.f;
+			return primary; // give up — anim will keep trying
+		};
 
-	if ( !shot->hurt )
+	// -------------------------------------------------------------------------
+	// Resolve miss: blacklist what we shot, flip to opposite primary
+	// -------------------------------------------------------------------------
+	if (resolve_miss)
 	{
-		enum_array<resolver_direction, bool, resolver_direction::resolver_direction_max> new_blacklist = {};
+		if (tried > resolver_direction::resolver_networked)
+			slot.m_blacklist[tried] = true;
 
-		for ( auto i = resolver_direction::resolver_networked; i < ( vars::aim.resolver_mode->get<int>() ? resolver_direction::resolver_max_extra : resolver_direction::resolver_direction_max ); i++ )
+		slot.m_current_dir = pick_opposite_primary(tried);
+
+		// Mirror a simple opposite onto the other mode so flip bucket isn't stale
+		if (mode != resolver_mode::resolver_shot && log.m_unknown)
 		{
-			//aimbot_helpers::draw_debug_hitboxes( player, shot->record.matrix( i ), -1, 3.f, Color( ( int ) i * 60, 255, 255, 255 ) );
-
-			aimbot::aimpoint_t aimpoint{};
-			aimpoint.hitbox = -2;
-			aimpoint.point = end;
-
-			auto damage = 0;
-			can_hit( local_player, penetration::pen_data( target_record, i, false, nullptr, &shot->weapon_data ), shot->shotpos, &aimpoint, damage, true );
-
-			if ( damage > 1.f )
-				new_blacklist[ i ] = log->m_mode[ current_mode ].m_side[ current_side ].m_blacklist[ i ] = true;
-		}
-
-		if ( shot->hit )
-		{
-			auto furthest_angle = -FLT_MAX;
-			auto furthest_dir = resolver_direction::resolver_invalid;
-
-			const auto target_pos = Vector( target_record->m_state[ state ].m_matrix[ hitbox->bone ][ 0 ][ 3 ], target_record->m_state[ state ].m_matrix[ hitbox->bone ][ 1 ][ 3 ], target_record->m_state[ state ].m_matrix[ hitbox->bone ][ 2 ][ 3 ] );
-			const auto target_state_ang = math::calc_angle( target_record->m_origin, target_pos );
-
-			for ( auto i = resolver_direction::resolver_networked; i < ( vars::aim.resolver_mode->get<int>() ? resolver_direction::resolver_max_extra : resolver_direction::resolver_direction_max ); i++ )
-			{
-				if ( log->m_mode[ current_mode ].m_side[ current_side ].m_blacklist[ i ] )
-					continue;
-
-				const auto pos = Vector( target_record->m_state[ i ].m_matrix[ hitbox->bone ][ 0 ][ 3 ], target_record->m_state[ i ].m_matrix[ hitbox->bone ][ 1 ][ 3 ], target_record->m_state[ i ].m_matrix[ hitbox->bone ][ 2 ][ 3 ] );
-				const auto angle = math::calc_angle( target_record->m_origin, pos );
-				const auto diff = fabsf( math::normalize_float( angle.y - target_state_ang.y ) );
-				if ( diff > furthest_angle )
-				{
-					furthest_dir = i;
-					furthest_angle = diff;
-				}
-			}
-
-			if ( furthest_dir != resolver_direction::resolver_invalid )
-			{
-				log->m_mode[ current_mode ].m_side[ current_side ].m_current_dir = furthest_dir;
-			}
-			else
-			{
-				log->m_mode[ current_mode ].m_side[ current_side ].m_current_dir = resolver_direction::resolver_networked;
-				if ( log->nospread.m_can_fake && log->nospread.m_pitch_cycle % 2 == shot->record.m_pitch_cycle % 2 )
-					log->nospread.m_pitch_cycle++;
-
-				if ( globals::nospread )
-					new_blacklist = {};
-				else if ( new_blacklist[ resolver_direction::resolver_networked ] )
-				{
-					furthest_angle = -FLT_MAX;
-					for ( auto i = resolver_direction::resolver_networked; i < ( vars::aim.resolver_mode->get<int>() ? resolver_direction::resolver_max_extra : resolver_direction::resolver_direction_max ); i++ )
-					{
-						if ( new_blacklist[ i ] )
-							continue;
-
-						const auto pos = Vector( target_record->m_state[ i ].m_matrix[ hitbox->bone ][ 0 ][ 3 ], target_record->m_state[ i ].m_matrix[ hitbox->bone ][ 1 ][ 3 ], target_record->m_state[ i ].m_matrix[ hitbox->bone ][ 2 ][ 3 ] );
-						const auto angle = math::calc_angle( target_record->m_origin, pos );
-						const auto diff = fabsf( math::normalize_float( angle.y - target_state_ang.y ) );
-						if ( diff > furthest_angle )
-						{
-							log->m_mode[ current_mode ].m_side[ current_side ].m_current_dir = i;
-							furthest_angle = diff;
-						}
-					}
-				}
-
-				log->m_mode[ current_mode ].m_side[ current_side ].m_blacklist = new_blacklist;
-			}
-		}
-	}
-	else if ( !legit )
-	{
-		enum_array<resolver_direction, bool, resolver_direction::resolver_direction_max> new_blacklist = {};
-		enum_array<resolver_direction, float, resolver_direction::resolver_direction_max> hit_dist{};
-		hit_dist.fill( FLT_MAX );
-
-		for ( auto i = resolver_direction::resolver_networked; i < ( vars::aim.resolver_mode->get<int>() ? resolver_direction::resolver_max_extra : resolver_direction::resolver_direction_max ); i++ )
-		{
-			//aimbot_helpers::draw_debug_hitboxes( player, shot->record.matrix, -1, 3.f, Color( ( int ) i * 60, 255, 255, 255 ) );
-
-			aimbot::aimpoint_t aimpoint{};
-			aimpoint.hitbox = -2;
-			aimpoint.point = end;
-
-			auto damage = 0;
-			can_hit( local_player, penetration::pen_data( target_record, i, false, nullptr, &shot->weapon_data ), shot->shotpos, &aimpoint, damage, true );
-
-			if ( damage < 1.f || aimpoint.hitgroup != shot->hitinfo.hitgroup )
-				new_blacklist[ i ] = log->m_mode[ current_mode ].m_side[ current_side ].m_blacklist[ i ] = true;
-			else
-			{
-				const auto hitpos = get_closest_hitpos( *shot, aimpoint.point );
-				hit_dist[ i ] = aimpoint.point.Dist( hitpos );
-			}
-		}
-
-		auto blacklist_full = true;
-		auto blacklist_invalid = false;
-
-		const auto prev_state = shot->record.m_shot_dir;
-
-		auto closest = FLT_MAX;
-		for ( auto i = resolver_direction::resolver_networked; i < ( vars::aim.resolver_mode->get<int>() ? resolver_direction::resolver_max_extra : resolver_direction::resolver_direction_max ); i++ )
-		{
-			if ( !log->m_mode[ current_mode ].m_side[ current_side ].m_blacklist[ i ] )
-				blacklist_full = false;
-
-			auto& cur = hit_dist[ i ];
-
-			if ( log->m_mode[ current_mode ].m_side[ current_side ].m_blacklist[ i ] && cur != FLT_MAX )
-				blacklist_invalid = true;
-
-			if ( cur < closest && hit_dist[ prev_state ] > 0.1f )
-			{
-				log->m_mode[ current_mode ].m_side[ current_side ].m_current_dir = i;
-				closest = cur;
-			}
-		}
-
-		if ( blacklist_full || blacklist_invalid )
-		{
-			log->m_mode[ current_mode ].m_side[ current_side ].m_blacklist = new_blacklist;
+			const auto other = static_cast<resolver_mode>((static_cast<int>(mode) + 1) % 2);
+			auto& other_slot = log.m_mode[other].m_side[side];
+			if (!other_slot.m_blacklist[slot.m_current_dir])
+				other_slot.m_current_dir = slot.m_current_dir;
 		}
 	}
 
-	if ( log->m_mode[ current_mode ].m_side[ current_side ].m_current_dir != state || shot->hurt )
+	// -------------------------------------------------------------------------
+	// Hit: lock the dir that worked, clear its blacklist
+	// -------------------------------------------------------------------------
+	if (registered_hit)
 	{
-		if ( current_mode == resolver_mode::resolver_shot )
-			log->m_unknown_shot = false;
+		if (tried > resolver_direction::resolver_networked)
+		{
+			slot.m_blacklist[tried] = false;
+			slot.m_current_dir = tried;
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// Unknown flags
+	// -------------------------------------------------------------------------
+	if (slot.m_current_dir != tried || registered_hit)
+	{
+		if (mode == resolver_mode::resolver_shot)
+			log.m_unknown_shot = false;
 		else
-			log->m_unknown = false;
-	}
-
-	if ( log->m_unknown && player->get_alive() && log->m_mode[ current_mode ].m_side[ current_side ].m_current_dir != state && current_mode != resolver_mode::resolver_shot && state != resolver_direction::resolver_networked )
-	{
-		const auto current_state = log->m_mode[ current_mode ].m_side[ current_side ].m_current_dir;
-		if ( current_state == resolver_direction::resolver_min_min || current_state == resolver_direction::resolver_max_max || current_state == resolver_direction::resolver_min_extra || current_state == resolver_direction::resolver_max_extra )
-			log->m_mode[ static_cast< resolver_mode >( ( static_cast< int >( current_mode ) + 1 ) % 2 ) ].m_side[ current_side ].m_current_dir = current_state == resolver_direction::resolver_min_min || current_state == resolver_direction::resolver_min_extra ? resolver_direction::resolver_max_max : resolver_direction::resolver_min_min;
-		else
-			log->m_mode[ static_cast< resolver_mode >( ( static_cast< int >( current_mode ) + 1 ) % 2 ) ].m_side[ current_side ].m_current_dir = current_state == resolver_direction::resolver_min ? resolver_direction::resolver_max : resolver_direction::resolver_min;
+			log.m_unknown = false;
 	}
 }
 
