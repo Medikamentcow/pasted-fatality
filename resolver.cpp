@@ -19,20 +19,33 @@ void resolver::post_animate(C_CSPlayer* player, lag_record_t* record)
 {
 	const auto log = &player_log::get_log(player->EntIndex());
 
-	// Only strip extras when resolver_mode limits the set.
-	// Enum order: networked(0), max(1), zero(2), min(3), max_extra(4), ...
-	// Do NOT use "> resolver_max" — that incorrectly wipes min/zero.
+	// Strip extras only; only mark unknown if the *active* slot was affected
 	if (vars::aim.resolver_mode->get<int>())
 	{
-		for (auto& mode : log->m_mode)
+		for (int mi = 0; mi < static_cast<int>(resolver_mode::resolver_mode_max); ++mi)
 		{
-			for (auto& side : mode.m_side)
+			const auto m = static_cast<resolver_mode>(mi);
+
+			for (int si = 0; si < static_cast<int>(resolver_side::resolver_side_max); ++si)
 			{
-				if (side.m_current_dir >= resolver_direction::resolver_max_extra)
+				const auto s = static_cast<resolver_side>(si);
+				auto& side = log->m_mode[m].m_side[s];
+
+				if (side.m_current_dir < resolver_direction::resolver_max_extra)
+					continue;
+
+				side.m_current_dir = resolver_direction::resolver_networked;
+
+				const bool active =
+					(m == log->m_current_mode && s == log->m_current_side) ||
+					(m == resolver_mode::resolver_shot && s == log->m_current_side);
+
+				if (active)
 				{
-					side.m_current_dir = resolver_direction::resolver_networked;
-					log->m_unknown_shot = true;
-					log->m_unknown = true;
+					if (m == resolver_mode::resolver_shot)
+						log->m_unknown_shot = true;
+					else
+						log->m_unknown = true;
 				}
 			}
 		}
@@ -57,15 +70,17 @@ void resolver::post_animate(C_CSPlayer* player, lag_record_t* record)
 			log->m_last_zero_pitch = interfaces::globals()->curtime;
 	}
 
-	// Copy resolved dir into shot-mode slot when still unknown on shots
 	const auto& live_dir =
 		log->m_mode[log->m_current_mode].m_side[log->m_current_side].m_current_dir;
 
+	// One-shot copy into shot slot, then clear so it doesn't spam every tick
 	if (log->m_unknown_shot && live_dir > resolver_direction::resolver_networked)
 	{
 		log->m_mode[resolver_mode::resolver_shot]
 			.m_side[log->m_current_side]
 			.m_current_dir = live_dir;
+
+		log->m_unknown_shot = false;
 	}
 }
 
@@ -358,6 +373,7 @@ void resolver::update_anim_info(player_log_t& log, lag_record_t* record, lag_rec
 	a.speed_2d = vel.Length2D();
 	a.on_ground = (record->m_flags & FL_ONGROUND) != 0;
 	a.is_moving = a.speed_2d > 5.f;
+	a.is_crouching = record->m_duckamt > 0.5f;
 	a.is_standing = !a.is_moving && a.on_ground;
 	a.choke = record->m_lagamt;
 
@@ -473,6 +489,11 @@ void resolver::yaw_resolve(const lag_record_t* record, const lag_record_t* previ
 	const auto& a = log.m_anim;
 	auto& j = log.m_jitter;
 
+	const bool in_air = !a.on_ground;
+	const bool crouching = a.is_crouching;
+	const bool grounded_crouch = a.on_ground && crouching;
+	const bool air_crouch = in_air && crouching;
+
 	// =========================================================================
 	// 1. MODE
 	// =========================================================================
@@ -486,20 +507,24 @@ void resolver::yaw_resolve(const lag_record_t* record, const lag_record_t* previ
 		a.layer3_break ||
 		a.lby_snapped;
 
+	// Grounded crouch: damp small mode flips (stable angle holds)
+	const float flip_eye = grounded_crouch ? 40.f : 30.f;
+	const float flip_break_eye = grounded_crouch ? 18.f : 10.f;
+
 	const bool want_flip =
-		(a.eye_yaw_delta > 30.f) ||
-		(anim_break && a.eye_yaw_delta > 10.f);
+		(a.eye_yaw_delta > flip_eye) ||
+		(anim_break && a.eye_yaw_delta > flip_break_eye);
 
 	const bool want_nonflip =
-		(a.eye_yaw_delta < -30.f) ||
-		(anim_break && a.eye_yaw_delta < -10.f);
+		(a.eye_yaw_delta < -flip_eye) ||
+		(anim_break && a.eye_yaw_delta < -flip_break_eye);
 
 	if ((log.m_current_mode == resolver_mode::resolver_flip && want_nonflip) ||
 		(log.m_current_mode == resolver_mode::resolver_default && want_flip))
 	{
 		log.m_current_mode = static_cast<resolver_mode>(!static_cast<int>(log.m_current_mode));
 	}
-	else if (huge_eye_turn || (anim_break && big_eye_turn))
+	else if (huge_eye_turn || (anim_break && big_eye_turn && !grounded_crouch))
 	{
 		log.m_current_mode = static_cast<resolver_mode>(!static_cast<int>(log.m_current_mode));
 	}
@@ -511,16 +536,36 @@ void resolver::yaw_resolve(const lag_record_t* record, const lag_record_t* previ
 		log.m_current_mode = resolver_mode::resolver_default;
 
 	// =========================================================================
-	// 2. SIDE — wall > jitter (mono / bimodal) > eye_feet
+	// 2. SIDE — wall > air > jitter (ground stand) > crouch/stand eye_feet
 	// =========================================================================
 	bool side_set = false;
 
-	// 2a. Wall
+	// 2a. Wall always wins when decisive
 	if (log.m_wall_side_valid)
 		side_set = true;
 
-	// 2b. Jitter
-	if (!side_set && j.sample_count >= j.MIN_SAMPLES)
+	// 2b. Air (including air + crouch): no jitter — move/eye + keep last side
+	if (!side_set && in_air)
+	{
+		float side_signal = a.eye_feet_delta * 0.35f + a.velocity_yaw_delta * 0.65f;
+
+		// Air crouch: slightly more weight on eye_feet (less pure strafe)
+		if (air_crouch)
+			side_signal = a.eye_feet_delta * 0.50f + a.velocity_yaw_delta * 0.50f;
+
+		constexpr float AIR_DEADZONE = 8.f;
+		if (fabsf(side_signal) >= AIR_DEADZONE)
+		{
+			log.m_current_side = (side_signal < 0.f)
+				? resolver_side::resolver_left
+				: resolver_side::resolver_right;
+		}
+		// else keep previous m_current_side (last grounded / last vote)
+		side_set = true;
+	}
+
+	// 2c. Jitter (ground only — standing or crouch-stand)
+	if (!side_set && a.on_ground && j.sample_count >= j.MIN_SAMPLES)
 	{
 		const int ticks_since =
 			interfaces::client_state()->get_last_server_tick() - j.last_commit_tick;
@@ -541,7 +586,6 @@ void resolver::yaw_resolve(const lag_record_t* record, const lag_record_t* previ
 			const float diff_hi = fabsf(math::angle_diff(record->m_eye_angles.y, cluster_hi));
 			const float diff_lo = fabsf(math::angle_diff(record->m_eye_angles.y, cluster_lo));
 
-			// Far cluster (aggressive; wrong on near-cluster ticks by design)
 			body_yaw = (diff_hi > diff_lo) ? cluster_hi : cluster_lo;
 
 			j.confidence = std::min(1.f, 0.45f + 0.1f * static_cast<float>(j.sign_flip_count))
@@ -551,26 +595,28 @@ void resolver::yaw_resolve(const lag_record_t* record, const lag_record_t* previ
 		}
 		else
 		{
-			const float var_conf = 1.f - clamp(
-				(j.ewm_var - j.VAR_LOW) / (j.VAR_HIGH - j.VAR_LOW),
-				0.f, 1.f);
-
-			j.confidence = var_conf * std::max(recency_conf, 0.1f);
+			const float sigma = sqrtf(std::max(j.ewm_var, 0.f));
+			const float var_conf = 1.f - clamp(sigma / 70.f, 0.f, 1.f);
+			j.confidence = std::max(0.15f, var_conf) * std::max(recency_conf, 0.1f);
 
 			const float blend_t = clamp(
 				static_cast<float>(ticks_since) / static_cast<float>(j.COMMIT_FRESH_TICKS),
 				0.f, 1.f);
 			body_yaw = math::lerp(j.last_commit_yaw, j.ewma, blend_t);
 
-			can_use = j.confidence >= j.CONFIDENCE_GATE;
+			can_use = j.confidence >= 0.20f;
 		}
+
+		// Full crouch hold: only use jitter if fairly confident (anim is cleaner)
+		if (grounded_crouch && j.confidence < 0.30f)
+			can_use = false;
 
 		if (can_use)
 		{
 			const float offset = math::angle_diff(record->m_eye_angles.y, body_yaw);
+			const float deadzone = grounded_crouch ? 3.5f : 5.f;
 
-			constexpr float DEADZONE = 5.f;
-			if (fabsf(offset) >= DEADZONE)
+			if (fabsf(offset) >= deadzone)
 			{
 				log.m_current_side = (offset > 0.f)
 					? resolver_side::resolver_right
@@ -580,15 +626,26 @@ void resolver::yaw_resolve(const lag_record_t* record, const lag_record_t* previ
 		}
 	}
 
-	// 2c. Eye / feet
+	// 2d. Ground eye / feet (stand or crouch)
 	if (!side_set)
 	{
 		float side_signal = a.eye_feet_delta;
+		float deadzone = 5.f;
 
 		if (a.is_moving && a.speed_2d > 20.f)
+		{
 			side_signal = a.eye_feet_delta * 0.55f + a.velocity_yaw_delta * 0.45f;
+			deadzone = 6.f;
+		}
 
-		if (fabsf(side_signal) >= 5.f)
+		// Grounded crouch: tighter deadzone, pure eye_feet
+		if (grounded_crouch)
+		{
+			side_signal = a.eye_feet_delta;
+			deadzone = 3.5f;
+		}
+
+		if (fabsf(side_signal) >= deadzone)
 		{
 			log.m_current_side = (side_signal < 0.f)
 				? resolver_side::resolver_left
@@ -607,7 +664,8 @@ void resolver::yaw_resolve(const lag_record_t* record, const lag_record_t* previ
 		? resolver_direction::resolver_min
 		: resolver_direction::resolver_max;
 
-	if (a.is_standing && fabsf(a.eye_feet_delta) > 25.f)
+	// Strong eye_feet override only when grounded (stand or crouch) — not in air
+	if (a.on_ground && fabsf(a.eye_feet_delta) > (grounded_crouch ? 18.f : 25.f))
 	{
 		picked = (a.eye_feet_delta < 0.f)
 			? resolver_direction::resolver_min
@@ -647,7 +705,7 @@ void resolver::on_createmove()
 
 		auto& newest = log.record.back();
 
-		if ( fabsf( eyepos.Length() - last_eyepos.Length() ) > 2.f )
+		if ((eyepos - last_eyepos).LengthSqr() > 4.f) // 2 units squared
 			newest.m_did_wall_detect = false;
 
 		if ( newest.m_did_wall_detect )
@@ -672,6 +730,7 @@ void resolver::wall_detect(lag_record_t* record)
 
 	record->m_did_wall_detect = true;
 	log.m_wall_side_valid = false;
+	log.m_wall_confidence = 0.f;
 
 	const Vector eye_pos = record->m_origin + Vector(0.f, 0.f, 64.f);
 	const Vector target = current_eye;
@@ -732,6 +791,15 @@ void resolver::wall_detect(lag_record_t* record)
 	log.m_wall_side_valid = true;
 	log.m_wall_detect_ang = math::normalize_float(
 		yaw + (new_side == resolver_side::resolver_left ? -90.f : 90.f));
+
+	// Confidence for brute: one-sided = 1, else scale by damage ratio
+	const float strong = std::max(dmg_left, dmg_right);
+	const float weak = std::max(1.f, std::min(dmg_left, dmg_right));
+	const float ratio = strong / weak;
+
+	log.m_wall_confidence =
+		(dmg_left <= 0.f || dmg_right <= 0.f) ? 1.f :
+		std::clamp((ratio - 1.f) / 2.f, 0.f, 1.f);
 }
 
 void resolver::add_shot( shot_t& shot )
@@ -1207,58 +1275,96 @@ void resolver::get_brute_angle(shot_t* shot)
 				|| d == resolver_direction::resolver_max_max;
 		};
 
-	auto pick_opposite_primary = [&](resolver_direction from) -> resolver_direction
+	auto opposite_primary = [&](resolver_direction d) -> resolver_direction
 		{
-			// Prefer plain min/max; only step to extras if primaries are blocked
-			const resolver_direction primary =
-				is_min_family(from) ? resolver_direction::resolver_max
-				: is_max_family(from) ? resolver_direction::resolver_min
-				: (side == resolver_side::resolver_left
-					? resolver_direction::resolver_max
-					: resolver_direction::resolver_min);
+			return is_min_family(d) ? resolver_direction::resolver_max : resolver_direction::resolver_min;
+		};
 
-			if (!slot.m_blacklist[primary])
-				return primary;
+	auto same_side_deeper = [](resolver_direction d) -> resolver_direction
+		{
+			switch (d)
+			{
+			case resolver_direction::resolver_min:       return resolver_direction::resolver_min_extra;
+			case resolver_direction::resolver_min_extra: return resolver_direction::resolver_min_min;
+			case resolver_direction::resolver_min_min:   return resolver_direction::resolver_min_min;
 
-			const resolver_direction extra =
-				(primary == resolver_direction::resolver_max)
-				? resolver_direction::resolver_max_extra
-				: resolver_direction::resolver_min_extra;
+			case resolver_direction::resolver_max:       return resolver_direction::resolver_max_extra;
+			case resolver_direction::resolver_max_extra: return resolver_direction::resolver_max_max;
+			case resolver_direction::resolver_max_max:   return resolver_direction::resolver_max_max;
 
-			if (!slot.m_blacklist[extra]
-				&& (!vars::aim.resolver_mode->get<int>() || extra < resolver_direction::resolver_max_extra))
-				return extra;
+			default: return d;
+			}
+		};
 
-			// Last resort: anything not blacklisted in the opposite family
-			const resolver_direction begin =
-				(primary == resolver_direction::resolver_max)
-				? resolver_direction::resolver_max
-				: resolver_direction::resolver_min;
-			const resolver_direction end =
-				(primary == resolver_direction::resolver_max)
-				? resolver_direction::resolver_max_max
-				: resolver_direction::resolver_min_extra;
+	auto first_available = [&](resolver_direction prefer) -> resolver_direction
+		{
+			if (!slot.m_blacklist[prefer])
+				return prefer;
 
-			for (auto d = begin; d <= end; d = static_cast<resolver_direction>(static_cast<int>(d) + 1))
+			const bool want_min = is_min_family(prefer);
+
+			const resolver_direction chain[] = {
+				want_min ? resolver_direction::resolver_min : resolver_direction::resolver_max,
+				want_min ? resolver_direction::resolver_min_extra : resolver_direction::resolver_max_extra,
+				want_min ? resolver_direction::resolver_min_min : resolver_direction::resolver_max_max,
+			};
+
+			for (const auto d : chain)
 			{
 				if (!slot.m_blacklist[d])
 					return d;
 			}
 
-			return primary; // give up — anim will keep trying
+			// opposite family
+			const resolver_direction opp[] = {
+				want_min ? resolver_direction::resolver_max : resolver_direction::resolver_min,
+				want_min ? resolver_direction::resolver_max_extra : resolver_direction::resolver_min_extra,
+				want_min ? resolver_direction::resolver_max_max : resolver_direction::resolver_min_min,
+			};
+
+			for (const auto d : opp)
+			{
+				if (!slot.m_blacklist[d])
+					return d;
+			}
+
+			return prefer;
 		};
 
 	// -------------------------------------------------------------------------
-	// Resolve miss: blacklist what we shot, flip to opposite primary
+	// Resolve miss
 	// -------------------------------------------------------------------------
 	if (resolve_miss)
 	{
 		if (tried > resolver_direction::resolver_networked)
 			slot.m_blacklist[tried] = true;
 
-		slot.m_current_dir = pick_opposite_primary(tried);
+		const bool wall_strong =
+			log.m_wall_side_valid && log.m_wall_confidence >= 0.55f;
 
-		// Mirror a simple opposite onto the other mode so flip bucket isn't stale
+		const bool tried_matches_wall =
+			(log.m_current_side == resolver_side::resolver_left && is_min_family(tried)) ||
+			(log.m_current_side == resolver_side::resolver_right && is_max_family(tried));
+
+		resolver_direction next;
+
+		if (wall_strong && tried_matches_wall)
+		{
+			// Stay on freestand side — step to a stronger desync on that side
+			next = same_side_deeper(tried);
+
+			if (next == tried || slot.m_blacklist[next])
+				next = opposite_primary(tried);
+		}
+		else
+		{
+			// Weak / no wall, or shot contradicted wall → classic flip
+			next = opposite_primary(tried);
+		}
+
+		slot.m_current_dir = first_available(next);
+
+		// Keep the other mode's side from going completely stale
 		if (mode != resolver_mode::resolver_shot && log.m_unknown)
 		{
 			const auto other = static_cast<resolver_mode>((static_cast<int>(mode) + 1) % 2);
@@ -1269,7 +1375,7 @@ void resolver::get_brute_angle(shot_t* shot)
 	}
 
 	// -------------------------------------------------------------------------
-	// Hit: lock the dir that worked, clear its blacklist
+	// Hit — lock what worked
 	// -------------------------------------------------------------------------
 	if (registered_hit)
 	{
@@ -1336,52 +1442,43 @@ void resolver::calc_missed_shots(shot_t* shot)
 			}
 		};
 
+	const auto safety_name = [](int s) -> const char*
+		{
+			if (s >= penetration::safety_full)
+				return "full";
+			if (s >= penetration::safety_no_roll)
+				return "no_roll";
+			return "none";
+		};
+
 	const auto dir = shot->record.m_shot_dir;
 	const auto side = shot->record.m_resolver_side;
 	const auto mode = shot->record.m_resolver_mode;
 
-	// ----- Dormant -----
-	if (shot->record.m_dormant)
-	{
-		if (shot->hurt)
-		{
-			const auto sound_player = sound_esp::get_sound_player(shot->enemy_index);
-			sound_player->last_update_tick = interfaces::client_state()->get_last_server_tick();
-			sound_player->updated = true;
-			log.m_dormant_misses = 0;
-		}
-		else
-		{
-			log.m_dormant_misses++;
-			interfaces::cvar()->ConsoleColorPrintf(Color(235, 5, 90), xorstr_("[fatality] "));
-			util::print_dev_console(true, Color(255, 100, 100),
-				xorstr_("missed dormant (total: %d)\n"), log.m_dormant_misses);
-		}
-		return;
-	}
+	char name[128] = "unknown";
+	player_info_t info{};
+	if (interfaces::engine()->GetPlayerInfo(shot->enemy_index, &info))
+		strcpy_s(name, info.name);
 
 	if (shot->hurt && globals::nospread && shot->hitinfo.hitgroup == HITGROUP_HEAD && !shot->record.m_shot)
 		log.nospread.m_pitch_cycle = 0;
 
 	interfaces::cvar()->ConsoleColorPrintf(Color(235, 5, 90), xorstr_("[fatality] "));
 
-	// ----- Hit -----
 	if (shot->hurt)
 	{
 		util::print_dev_console(true, Color(100, 255, 100),
-			xorstr_("hit - dir=%-10s side=%-5s mode=%-7s safety=%d dmg=%d hc=%.0f jitter_n=%d conf=%.2f\n"),
+			xorstr_("hit %s - dir=%s side=%s mode=%s safety=%s dmg=%d hc=%.0f\n"),
+			name,
 			dir_name(dir),
 			side_name(side),
 			mode_name(mode),
-			shot->safety,
+			safety_name(shot->safety),
 			shot->hitinfo.damage > 0 ? shot->hitinfo.damage : shot->damage,
-			shot->hitchance,
-			log.m_jitter.sample_count,
-			log.m_jitter.confidence);
+			shot->hitchance);
 		return;
 	}
 
-	// ----- Client hit, server miss (resolve) -----
 	if (shot->hit)
 	{
 		if (shot->record.m_unknown)
@@ -1389,19 +1486,17 @@ void resolver::calc_missed_shots(shot_t* shot)
 		log.m_shots++;
 
 		util::print_dev_console(true, Color(255, 80, 80),
-			xorstr_("miss resolve - dir=%-10s side=%-5s mode=%-7s safety=%d dmg=%d hc=%.0f jitter_n=%d conf=%.2f\n"),
+			xorstr_("missed %s due to resolver - dir=%s side=%s mode=%s safety=%s dmg=%d hc=%.0f\n"),
+			name,
 			dir_name(dir),
 			side_name(side),
 			mode_name(mode),
-			shot->safety,
+			safety_name(shot->safety),
 			shot->damage,
-			shot->hitchance,
-			log.m_jitter.sample_count,
-			log.m_jitter.confidence);
+			shot->hitchance);
 		return;
 	}
 
-	// ----- No client registration -----
 	log.m_shots_spread++;
 
 	const char* reason = "spread";
@@ -1411,12 +1506,13 @@ void resolver::calc_missed_shots(shot_t* shot)
 		reason = "server correction";
 
 	util::print_dev_console(true, Color(255, 180, 80),
-		xorstr_("miss %s - dir=%-10s side=%-5s mode=%-7s safety=%d dmg=%d hc=%.0f\n"),
+		xorstr_("missed %s due to %s - dir=%s side=%s mode=%s safety=%s dmg=%d hc=%.0f\n"),
+		name,
 		reason,
 		dir_name(dir),
 		side_name(side),
 		mode_name(mode),
-		shot->safety,
+		safety_name(shot->safety),
 		shot->damage,
 		shot->hitchance);
 }
