@@ -4,187 +4,174 @@
 #include "../include_cheat.h"
 #include "mt.h"
 
-aimbot::aimpoint_t hitscan::hitscan_record( aimbot::target_data_t* target, lag_record_t& record, int safety, lag_record_t* extra, Vector eyepos )
+aimbot::aimpoint_t hitscan::hitscan_record(aimbot::target_data_t* target, lag_record_t& record, int safety, lag_record_t* extra, Vector eyepos)
 {
 	std::array<circular_buffer<aimbot::aimpoint_t, 78>, HITBOX_MAX> hitbox_points = {};
 	std::vector<std::shared_ptr<detail::call_queue::queue_element>> hitbox_traces = {};
 	aimbot::aimpoint_t aimpoint{};
 
-	const auto player = globals::get_player( record.m_index );
-	auto log = &player_log::get_log( record.m_index );
-	const auto current_state = log->get_dir( &record );
+	const auto player = globals::get_player(record.m_index);
+	auto log = &player_log::get_log(record.m_index);
+	const auto current_state = log->get_dir(&record);
 	const auto weapon = local_weapon;
 
 	const auto model = player->get_model();
-	if ( !model )
+	if (!model)
 		return aimpoint;
 
-	const auto studio_hdr = interfaces::model_info()->GetStudioModel( model );
-	if ( !studio_hdr )
+	const auto studio_hdr = interfaces::model_info()->GetStudioModel(model);
+	if (!studio_hdr)
 		return aimpoint;
 
-	const auto config = config::current_config( weapon );
+	const auto config = config::current_config(weapon);
 	const auto is_zeus = weapon->get_weapon_id() == WEAPON_TASER;
 	const auto is_knife = !is_zeus && weapon->get_weapon_type() == WEAPONTYPE_KNIFE;
 	const auto moving = record.m_velocity.Length() > 4.f;
 	const auto on_ground = record.m_flags & FL_ONGROUND;
 	const auto weapon_data = weapon->get_wpn_data();
 
-	const auto spread_rad = aimbot_helpers::get_lowest_inaccuracy( weapon );
-	const auto corner_rad = DEG2RAD( 90.f - RAD2DEG( spread_rad ) );
-	const auto dist = record.m_origin.Dist( local_player->get_origin() );
-	const auto spread_radius = ( dist / sinf( corner_rad ) ) * sinf( spread_rad );
+	const auto spread_rad = std::max(aimbot_helpers::get_lowest_inaccuracy(weapon), 1e-6f);
+	const auto corner_rad = DEG2RAD(90.f - RAD2DEG(spread_rad));
+	const auto sin_corner = sinf(corner_rad);
+	const auto dist = record.m_origin.Dist(local_player->get_origin());
+	const auto spread_radius = (sin_corner > 1e-6f)
+		? (dist / sin_corner) * sinf(spread_rad)
+		: 0.f;
 
 	auto baim = vars::aim.baim_on_key->get<bool>();
-	if ( config->baim.air->get<bool>() && !( record.m_flags & FL_ONGROUND ) && player->get_move_type() != MOVETYPE_LADDER
+	if (config->baim.air->get<bool>() && !(record.m_flags & FL_ONGROUND) && player->get_move_type() != MOVETYPE_LADDER
 		|| config->baim.moving->get<bool>() && record.m_velocity.Length2D() > 4.f
-		|| config->baim.standing->get<bool>() && record.m_velocity.Length2D() <= 4.f )
+		|| config->baim.standing->get<bool>() && record.m_velocity.Length2D() <= 4.f)
 		baim = true;
 
-	if ( vars::aim.headshot_only() )
+	if (vars::aim.headshot_only())
 		baim = false;
 
-	for ( auto i = 0u; i < HITBOX_MAX; i++ )
+	for (auto i = 0u; i < HITBOX_MAX; i++)
 	{
-		if ( !is_knife && !is_zeus && !enabled_hitboxes[ i ] )
+		if (!is_knife && !is_zeus && !enabled_hitboxes[i])
 			continue;
 
-		if ( !is_knife && !is_zeus && baim && ( i == HITBOX_HEAD || i == HITBOX_LEFT_FOOT || i == HITBOX_RIGHT_FOOT ) )
+		if (!is_knife && !is_zeus && baim && (i == HITBOX_HEAD || i == HITBOX_LEFT_FOOT || i == HITBOX_RIGHT_FOOT))
 			continue;
 
-		if ( !is_knife && ( i == HITBOX_RIGHT_FOOT ||
+		if (!is_knife && (i == HITBOX_RIGHT_FOOT ||
 			i == HITBOX_LEFT_FOOT ||
 			i == HITBOX_LEFT_UPPER_ARM ||
 			i == HITBOX_RIGHT_UPPER_ARM ||
 			i == HITBOX_RIGHT_CALF ||
-			i == HITBOX_LEFT_CALF ) &&
-			( moving && config->ignore_limbs->get<bool>() || log->m_shots > 4 && config->fallback_mode->get<int>() != 0 || !on_ground && config->force_safe.air->get<bool>() ) )
+			i == HITBOX_LEFT_CALF) &&
+			(moving && config->ignore_limbs->get<bool>() || log->m_shots > 4 && config->fallback_mode->get<int>() != 0 || !on_ground && config->force_safe.air->get<bool>()))
 			continue;
 
-		if ( is_knife && i != HITBOX_UPPER_CHEST && i != HITBOX_PELVIS && ( i != HITBOX_LEFT_FOOT && i != HITBOX_RIGHT_FOOT || !moving ) )
+		if (is_knife && i != HITBOX_UPPER_CHEST && i != HITBOX_PELVIS && (i != HITBOX_LEFT_FOOT && i != HITBOX_RIGHT_FOOT || !moving))
 			continue;
 
-		if ( is_zeus && i != HITBOX_UPPER_CHEST && i != HITBOX_PELVIS && i != HITBOX_BODY )
+		if (is_zeus && i != HITBOX_UPPER_CHEST && i != HITBOX_PELVIS && i != HITBOX_BODY)
 			continue;
 
-		const auto calc_hitbox = [&, i] () -> void
-		{
-			multipoint_hitbox( hitbox_points[ i ], i, studio_hdr, record, eyepos, spread_radius, is_knife, is_zeus, config, is_zeus ? penetration::safety_full : safety, extra, weapon_data );
-			if ( hitbox_points[ i ].empty() )
-				return;
-
-			for ( auto j = 0; j < hitbox_points[ i ].size(); j++ )
+		const auto calc_hitbox = [&, i]() -> void
 			{
-				auto& point = hitbox_points[ i ][ j ];
+				multipoint_hitbox(hitbox_points[i], i, studio_hdr, record, eyepos, spread_radius, is_knife, is_zeus, config, is_zeus ? penetration::safety_full : safety, extra, weapon_data);
+				if (hitbox_points[i].empty())
+					return;
 
-				point.hitchance = 0.f;
+				for (auto j = 0; j < hitbox_points[i].size(); j++)
+				{
+					auto& point = hitbox_points[i][j];
+					point.hitchance = 0.f;
+					can_hit(local_player, penetration::pen_data(&record, current_state, player->get_player_info().fakeplayer ? 0 : point.safety, extra), eyepos, &point, point.damage);
+				}
+			};
 
-				can_hit( local_player, penetration::pen_data( &record, current_state, player->get_player_info().fakeplayer ? 0 : point.safety, extra ), eyepos, &point, point.damage );
-			}
-		};
-
-		//calc_hitbox();
-		hitbox_traces.emplace_back( std::make_shared<detail::call_queue::queue_element>( calc_hitbox ) );
+		hitbox_traces.emplace_back(std::make_shared<detail::call_queue::queue_element>(calc_hitbox));
 	}
 
-	detail::callqueue.perform( hitbox_traces );
+	detail::callqueue.perform(hitbox_traces);
 
 	auto has_safepoint = false;
-	//auto has_hitchance = false;
-	const auto limb_safety = config::current_config( weapon )->extra_safety.limbs->get<bool>() ? penetration::safety_full : config::current_config( weapon )->force_safe.limbs->get<bool>() ? penetration::safety_no_roll : penetration::safety_none;
+	const auto limb_safety = config::current_config(weapon)->extra_safety.limbs->get<bool>() ? penetration::safety_full : config::current_config(weapon)->force_safe.limbs->get<bool>() ? penetration::safety_no_roll : penetration::safety_none;
 	auto best_shots_to_kill = 100;
 
 	auto lethal_safety = penetration::safety_none;
 	auto lethal_baim = false;
 	auto highest_damage = 0;
 
-	const auto minimum_dmg = static_cast< int >( config->mindmg_override_enabled->get< bool >() ? config->mindmg_override->get< float >() : config->mindmg->get< float >() );
-	const auto additional_damage = std::max( 0, minimum_dmg - 100 );
-	for ( const auto& trace : hitbox_points )
-		for ( auto i = 0; i < trace.size(); i++ )
+	const auto minimum_dmg = static_cast<int>(config->mindmg_override_enabled->get<bool>() ? config->mindmg_override->get<float>() : config->mindmg->get<float>());
+	const auto additional_damage = std::max(0, minimum_dmg - 100);
+
+	for (const auto& trace : hitbox_points)
+		for (auto i = 0; i < trace.size(); i++)
 		{
-			const auto& trace_aimpoint = trace[ i ];
+			const auto& trace_aimpoint = trace[i];
 
-			if ( vars::aim.headshot_only() )
+			if (vars::aim.headshot_only())
 				continue;
 
-			if ( trace_aimpoint.hitbox != HITBOX_BODY && trace_aimpoint.hitbox != HITBOX_PELVIS && trace_aimpoint.hitbox != HITBOX_UPPER_CHEST )
+			if (trace_aimpoint.hitbox != HITBOX_BODY && trace_aimpoint.hitbox != HITBOX_PELVIS && trace_aimpoint.hitbox != HITBOX_UPPER_CHEST)
 				continue;
 
-			if ( trace_aimpoint.no_pen_damage < player->get_predicted_health() + additional_damage )
+			if (trace_aimpoint.no_pen_damage < player->get_predicted_health() + additional_damage)
 				continue;
 
-			lethal_baim = config::current_config( weapon )->baim.lethal->get<bool>() && !vars::aim.headshot_only();
-			lethal_safety = config::current_config( weapon )->extra_safety.lethal->get<bool>() ? penetration::safety_full : config::current_config( weapon )->force_safe.lethal->get<bool>() ? penetration::safety_no_roll : penetration::safety_none;
+			lethal_baim = config::current_config(weapon)->baim.lethal->get<bool>() && !vars::aim.headshot_only();
+			lethal_safety = config::current_config(weapon)->extra_safety.lethal->get<bool>() ? penetration::safety_full : config::current_config(weapon)->force_safe.lethal->get<bool>() ? penetration::safety_no_roll : penetration::safety_none;
 		}
 
-	if ( !has_safepoint && safety == penetration::safety_full )
+	if (!has_safepoint && safety == penetration::safety_full)
 		safety = penetration::safety_no_roll;
 
-	if ( !has_safepoint && lethal_safety == penetration::safety_full )
+	if (!has_safepoint && lethal_safety == penetration::safety_full)
 		lethal_safety = penetration::safety_no_roll;
 
-
-	for ( const auto& trace : hitbox_points )
-		for ( auto i = 0; i < trace.size(); i++ )
+	for (const auto& trace : hitbox_points)
+		for (auto i = 0; i < trace.size(); i++)
 		{
-			const auto& trace_aimpoint = trace[ i ];
+			const auto& trace_aimpoint = trace[i];
 
-			if ( trace_aimpoint.safety < lethal_safety )
+			if (trace_aimpoint.safety < lethal_safety)
 				continue;
 
-			if ( lethal_baim && trace_aimpoint.hitbox != HITBOX_BODY && trace_aimpoint.hitbox != HITBOX_PELVIS && trace_aimpoint.hitbox != HITBOX_UPPER_CHEST )
+			if (lethal_baim && trace_aimpoint.hitbox != HITBOX_BODY && trace_aimpoint.hitbox != HITBOX_PELVIS && trace_aimpoint.hitbox != HITBOX_UPPER_CHEST)
 				continue;
 
-			if ( trace_aimpoint.safety == penetration::safety_full && trace_aimpoint.no_pen_damage >= 1 )
+			if (trace_aimpoint.safety == penetration::safety_full && trace_aimpoint.no_pen_damage >= 1)
 				has_safepoint = true;
 
-			if ( trace_aimpoint.damage > highest_damage )
+			if (trace_aimpoint.damage > highest_damage)
 				highest_damage = trace_aimpoint.damage;
 
-			if ( trace_aimpoint.hitgroup == HITGROUP_STOMACH && trace_aimpoint.no_pen_damage > highest_damage )
+			if (trace_aimpoint.hitgroup == HITGROUP_STOMACH && trace_aimpoint.no_pen_damage > highest_damage)
 				highest_damage = trace_aimpoint.no_pen_damage;
 		}
-/*
-#if defined(ALPHA) || !defined(RELEASE)
-	if ( !visuals::players[ record.m_index ].debug.target_sp && lethal_safety > 0 )
-		visuals::players[ record.m_index ].debug.target_sp = lethal_safety > 0;
-	if ( !visuals::players[ record.m_index ].debug.target_vsp && lethal_safety == penetration::safety_full )
-		visuals::players[ record.m_index ].debug.target_vsp = true;
 
-	visuals::players[ record.m_index ].debug.reason = XOR_STR( "NO HITPOINT" );
-	visuals::players[ record.m_index ].debug.dmg = 0;
-#endif*/
-
-	//std::string extra_info = xorstr_( "\navailable:\n" );
-
-	for ( auto& trace : hitbox_points )
+	for (auto& trace : hitbox_points)
 	{
-		for ( auto i = 0; i < trace.size(); i++ )
+		for (auto i = 0; i < trace.size(); i++)
 		{
-			auto& trace_aimpoint = trace[ i ];
+			auto& trace_aimpoint = trace[i];
 
 			trace_aimpoint.player_health = player->get_predicted_health();
 
-			if ( vars::aim.headshot_only() && trace_aimpoint.hitbox != HITBOX_HEAD )
+			if (vars::aim.headshot_only() && trace_aimpoint.hitbox != HITBOX_HEAD)
 				continue;
 
-			if ( safety == penetration::safety_full && trace_aimpoint.safety < penetration::safety_full )
+			if (safety == penetration::safety_full && trace_aimpoint.safety < penetration::safety_full)
 				continue;
 
-			if ( safety == penetration::safety_no_roll && trace_aimpoint.safety < penetration::safety_no_roll )
+			if (safety == penetration::safety_no_roll && trace_aimpoint.safety < penetration::safety_no_roll)
 				continue;
 
-			if ( trace_aimpoint.safety < lethal_safety )
+			if (trace_aimpoint.safety < lethal_safety)
 				continue;
 
-			if ( lethal_safety == penetration::safety_full && trace_aimpoint.hitbox != HITBOX_BODY && trace_aimpoint.hitbox != HITBOX_PELVIS && trace_aimpoint.hitbox != HITBOX_UPPER_CHEST )
+			if (lethal_safety == penetration::safety_full && trace_aimpoint.hitbox != HITBOX_BODY && trace_aimpoint.hitbox != HITBOX_PELVIS && trace_aimpoint.hitbox != HITBOX_UPPER_CHEST)
 				continue;
 
-			if ( lethal_baim && trace_aimpoint.hitbox != HITBOX_BODY && trace_aimpoint.hitbox != HITBOX_PELVIS && trace_aimpoint.hitbox != HITBOX_UPPER_CHEST )
+			if (lethal_baim && trace_aimpoint.hitbox != HITBOX_BODY && trace_aimpoint.hitbox != HITBOX_PELVIS && trace_aimpoint.hitbox != HITBOX_UPPER_CHEST)
 				continue;
 
-			if ( is_zeus && ( trace_aimpoint.safety < penetration::safety_full && has_safepoint || trace_aimpoint.safety < penetration::safety_no_roll ) )
+			if (is_zeus && (trace_aimpoint.safety < penetration::safety_full && has_safepoint || trace_aimpoint.safety < penetration::safety_no_roll))
 				continue;
 
 			const auto is_limb = trace_aimpoint.hitbox == HITBOX_RIGHT_FOOT ||
@@ -194,152 +181,119 @@ aimbot::aimpoint_t hitscan::hitscan_record( aimbot::target_data_t* target, lag_r
 				trace_aimpoint.hitbox == HITBOX_RIGHT_CALF ||
 				trace_aimpoint.hitbox == HITBOX_LEFT_CALF;
 
-			if ( is_limb && ( trace_aimpoint.safety < limb_safety || limb_safety != penetration::safety_none && ( limb_safety == penetration::safety_full ? trace_aimpoint.safety_size < 5.f : 0 ) ) )
+			if (is_limb && (trace_aimpoint.safety < limb_safety || limb_safety != penetration::safety_none && (limb_safety == penetration::safety_full ? trace_aimpoint.safety_size < 5.f : 0)))
 				continue;
 
-			const auto mindmg = config::current_config( weapon )->get_mindmg( player, highest_damage );
+			const auto mindmg = config::current_config(weapon)->get_mindmg(player, highest_damage);
 
 			auto hitbox = trace_aimpoint.hitbox;
-			if ( trace_aimpoint.hitbox == HITBOX_PELVIS )
+			if (trace_aimpoint.hitbox == HITBOX_PELVIS)
 				hitbox = HITBOX_BODY;
-
-			if ( trace_aimpoint.hitbox == HITBOX_UPPER_CHEST )
+			if (trace_aimpoint.hitbox == HITBOX_UPPER_CHEST)
 				hitbox = HITBOX_CHEST;
 
-			if ( trace_aimpoint.no_pen_damage >= mindmg && !is_knife && !is_zeus && !target->hitboxes[ hitbox ] && trace_aimpoint.safety != penetration::safety_none )
-				target->hitboxes[ hitbox ] = true;
+			if (trace_aimpoint.no_pen_damage >= mindmg && !is_knife && !is_zeus && !target->hitboxes[hitbox] && trace_aimpoint.safety != penetration::safety_none)
+				target->hitboxes[hitbox] = true;
 
-			if ( !is_knife && trace_aimpoint.damage < 1 )
+			if (!is_knife && trace_aimpoint.damage < 1)
 				continue;
 
-//#if defined(ALPHA) || !defined(RELEASE)
-			//visuals::players[ record.m_index ].debug.reason = XOR_STR( "NO DAMAGE" );
-		//	if ( trace_aimpoint.damage > visuals::players[ record.m_index ].debug.dmg )
-		//	{
-		//		visuals::players[ record.m_index ].debug.dmg = trace_aimpoint.damage;
-		//	}
-//#endif
-
-			if ( is_zeus && trace_aimpoint.damage < 100 && trace_aimpoint.damage < player->get_predicted_health() )
+			if (is_zeus && trace_aimpoint.damage < 100 && trace_aimpoint.damage < player->get_predicted_health())
 				continue;
 
-			if ( is_knife )
+			if (is_knife)
 			{
-				if ( trace_aimpoint.damage > aimpoint.damage )
+				if (trace_aimpoint.damage > aimpoint.damage)
 					aimpoint = trace_aimpoint;
-
 				continue;
 			}
 
-//#if defined(ALPHA) || !defined(RELEASE)
-	//		visuals::players[ record.m_index ].debug.target_dmg = mindmg;
-	//		visuals::players[ record.m_index ].debug.dmg = trace_aimpoint.damage;
-//#endif
-			if ( trace_aimpoint.damage < mindmg )
+			if (trace_aimpoint.damage < mindmg)
 				continue;
 
-			const auto overwrite_point = [&] ()
-			{
-				//extra_info += "[ " + std::to_string( trace_aimpoint.hitbox ) + " " + std::to_string( trace_aimpoint.damage ) + " " + std::to_string( trace_aimpoint.safety ) + " " + std::to_string( trace_aimpoint.safety_size ) + " " + std::to_string( trace_aimpoint.center_dist ) + " ]\n";
-
-				if ( aimpoint.damage < 1 && trace_aimpoint.damage >= 1 )
+			const auto overwrite_point = [&]()
 				{
+					if (aimpoint.damage < 1 && trace_aimpoint.damage >= 1)
+					{
+						const auto is_singleshot = weapon->get_weapon_id() == WEAPON_SSG08 || weapon->get_weapon_id() == WEAPON_AWP || weapon->get_weapon_id() == WEAPON_REVOLVER || misc::retract_peek;
+						const auto doubletap_ready = tickbase::fast_fire && !is_singleshot && tickbase::compute_current_limit() > 2;
+						const auto health = player->get_predicted_health() + (trace_aimpoint.penetration_points.size() > 1 ? 5 : 0);
+						const auto shots_to_kill = static_cast<int>(ceilf(health / fminf(floorf(trace_aimpoint.damage * (doubletap_ready ? 2.f : 1.f)), health)));
+						best_shots_to_kill = shots_to_kill;
+						aimpoint = trace_aimpoint;
+						return;
+					}
+
+					if (aimpoint.safety >= penetration::safety_no_roll && trace_aimpoint.safety < penetration::safety_no_roll
+						&& (config::current_config(weapon)->fallback_mode->get<int>() == 2
+							|| config::current_config(weapon)->fallback_mode->get<int>() == 1 && log->m_shots))
+						return;
+
 					const auto is_singleshot = weapon->get_weapon_id() == WEAPON_SSG08 || weapon->get_weapon_id() == WEAPON_AWP || weapon->get_weapon_id() == WEAPON_REVOLVER || misc::retract_peek;
 					const auto doubletap_ready = tickbase::fast_fire && !is_singleshot && tickbase::compute_current_limit() > 2;
 
-					const auto health = player->get_predicted_health() + ( trace_aimpoint.penetration_points.size() > 1 ? 5 : 0 );
-					const auto shots_to_kill = static_cast< int >( ceilf( health / fminf( floorf( trace_aimpoint.damage * ( doubletap_ready ? 2.f : 1.f ) ), health ) ) );
+					const auto health = player->get_predicted_health() + (trace_aimpoint.penetration_points.size() > 1 ? 5 : 0);
+					const auto health_aimpoint = player->get_predicted_health() + (aimpoint.penetration_points.size() > 1 ? 5 : 0);
 
-					best_shots_to_kill = shots_to_kill;
+					const auto shots_to_kill = static_cast<int>(ceilf(health / fminf(floorf(trace_aimpoint.damage * (doubletap_ready ? 2.f : 1.f)), health)));
+					const auto shots_to_kill_aimpoint = static_cast<int>(ceilf(health_aimpoint / fminf(floorf(aimpoint.damage * (doubletap_ready ? 2.f : 1.f)), health_aimpoint)));
+
+					if (trace_aimpoint.damage + 5 < aimpoint.damage && shots_to_kill_aimpoint > 2)
+						return;
+
+					if (shots_to_kill >= best_shots_to_kill * 2)
+						return;
+
+					if (aimpoint.safety >= penetration::safety_no_roll && shots_to_kill_aimpoint == 1 && trace_aimpoint.safety < penetration::safety_no_roll)
+						return;
+
+					if (aimpoint.safety >= penetration::safety_no_roll && trace_aimpoint.safety < penetration::safety_no_roll && shots_to_kill_aimpoint == shots_to_kill)
+						return;
+
+					if (trace_aimpoint.safety_size < aimpoint.safety_size && shots_to_kill_aimpoint <= shots_to_kill && trace_aimpoint.safety == aimpoint.safety)
+						return;
+
+					if (shots_to_kill_aimpoint <= shots_to_kill && trace_aimpoint.safety < aimpoint.safety)
+						return;
+
+					const auto hitbox = player->get_model_ptr()->m_pStudioHdr->pHitbox(trace_aimpoint.hitbox, 0);
+					const auto hitbox_aimpoint = player->get_model_ptr()->m_pStudioHdr->pHitbox(aimpoint.hitbox, 0);
+					if (shots_to_kill == shots_to_kill_aimpoint && hitbox->radius != -1.f && hitbox_aimpoint->radius == -1.f)
+					{
+						best_shots_to_kill = shots_to_kill;
+						aimpoint = trace_aimpoint;
+						return;
+					}
+
+					if (fabsf(trace_aimpoint.safety_size - aimpoint.safety_size) <= 5.f && shots_to_kill_aimpoint <= shots_to_kill)
+					{
+						const auto volume = std::min(1600.f, M_PI * powf(hitbox->radius, 2) * (4.f / 3.f * hitbox->radius + (hitbox->bbmax - hitbox->bbmin).Length()));
+						const auto volume_aimpoint = std::min(1600.f, M_PI * powf(hitbox_aimpoint->radius, 2) * (4.f / 3.f * hitbox_aimpoint->radius + (hitbox_aimpoint->bbmax - hitbox_aimpoint->bbmin).Length()));
+
+						if (volume < volume_aimpoint - 2.f)
+							return;
+
+						if (fabsf(volume - volume_aimpoint) < 2.f && trace_aimpoint.hitbox > aimpoint.hitbox)
+							return;
+
+						if (trace_aimpoint.center_dist > aimpoint.center_dist + 0.3f && fabsf(volume - volume_aimpoint) < 2.f)
+							return;
+					}
+
+					if (shots_to_kill < best_shots_to_kill)
+						best_shots_to_kill = shots_to_kill;
+
 					aimpoint = trace_aimpoint;
-					return false;
-				}
+				};
 
-				// prefer safe point
-				if ( aimpoint.safety >= penetration::safety_no_roll && trace_aimpoint.safety < penetration::safety_no_roll && ( config::current_config( weapon )->fallback_mode->get<int>() == 2 || config::current_config( weapon )->fallback_mode->get<int>() == 1 && log->m_shots ) )
-					return false;
-
-				const auto is_singleshot = weapon->get_weapon_id() == WEAPON_SSG08 || weapon->get_weapon_id() == WEAPON_AWP || weapon->get_weapon_id() == WEAPON_REVOLVER || misc::retract_peek;
-				const auto doubletap_ready = tickbase::fast_fire && !is_singleshot && tickbase::compute_current_limit() > 2;
-
-				const auto health = player->get_predicted_health() + ( trace_aimpoint.penetration_points.size() > 1 ? 5 : 0 );
-				const auto health_aimpoint = player->get_predicted_health() + ( aimpoint.penetration_points.size() > 1 ? 5 : 0 );
-
-				const auto shots_to_kill = static_cast< int >( ceilf( health / fminf( floorf( trace_aimpoint.damage * ( doubletap_ready ? 2.f : 1.f ) ), health ) ) );
-				const auto shots_to_kill_aimpoint = static_cast< int >( ceilf( health_aimpoint / fminf( floorf( aimpoint.damage * ( doubletap_ready ? 2.f : 1.f ) ), health_aimpoint ) ) );
-
-				if ( trace_aimpoint.damage + 5 < aimpoint.damage && shots_to_kill_aimpoint > 2 )
-					return false;
-
-				if ( shots_to_kill >= best_shots_to_kill * 2 )
-					return false;
-
-				/*if ( aimpoint.safety >= penetration::safety_no_roll && trace_aimpoint.safety >= penetration::safety_no_roll )
-				{
-					const auto shots_to_kill = static_cast< int >( ceilf( health / fminf( floorf( trace_aimpoint.safe_point_damage * ( doubletap_ready ? 2.f : 1.f ) ), health ) ) );
-					const auto shots_to_kill_aimpoint = static_cast< int >( ceilf( health_aimpoint / fminf( floorf( aimpoint.safe_point_damage * ( doubletap_ready ? 2.f : 1.f ) ), health_aimpoint ) ) );
-
-					if ( shots_to_kill >= shots_to_kill_aimpoint * 2 )
-						return false;
-				}*/
-
-				// has lethal safe point
-				if ( aimpoint.safety >= penetration::safety_no_roll && shots_to_kill_aimpoint == 1 && trace_aimpoint.safety < penetration::safety_no_roll )
-					return false;
-
-				if ( aimpoint.safety >= penetration::safety_no_roll && trace_aimpoint.safety < penetration::safety_no_roll && shots_to_kill_aimpoint == shots_to_kill )
-					return false;
-
-				if ( trace_aimpoint.safety_size < aimpoint.safety_size && shots_to_kill_aimpoint <= shots_to_kill && trace_aimpoint.safety == aimpoint.safety )
-					return false;
-
-				if ( shots_to_kill_aimpoint <= shots_to_kill && trace_aimpoint.safety < aimpoint.safety )
-					return false;
-
-				const auto hitbox = player->get_model_ptr()->m_pStudioHdr->pHitbox( trace_aimpoint.hitbox, 0 );
-				const auto hitbox_aimpoint = player->get_model_ptr()->m_pStudioHdr->pHitbox( aimpoint.hitbox, 0 );
-				if ( shots_to_kill == shots_to_kill_aimpoint && hitbox->radius != -1.f && hitbox_aimpoint->radius == -1.f )
-				{
-					best_shots_to_kill = shots_to_kill;
-					aimpoint = trace_aimpoint;
-					return false;
-				}
-
-				if ( fabsf( trace_aimpoint.safety_size - aimpoint.safety_size ) <= 5.f && shots_to_kill_aimpoint <= shots_to_kill )
-				{
-					const auto volume = std::min( 1600.f, M_PI * powf( hitbox->radius, 2 ) * ( 4.f / 3.f * hitbox->radius + ( hitbox->bbmax - hitbox->bbmin ).Length() ) );
-					const auto volume_aimpoint = std::min( 1600.f, M_PI * powf( hitbox_aimpoint->radius, 2 ) * ( 4.f / 3.f * hitbox_aimpoint->radius + ( hitbox_aimpoint->bbmax - hitbox_aimpoint->bbmin ).Length() ) );
-
-					if ( volume < volume_aimpoint - 2.f )
-						return false;
-
-					if ( fabsf( volume - volume_aimpoint ) < 2.f && trace_aimpoint.hitbox > aimpoint.hitbox )
-						return false;
-
-					if ( trace_aimpoint.center_dist > aimpoint.center_dist + 0.3f && fabsf( volume - volume_aimpoint ) < 2.f )
-						return false;
-				}
-
-				if ( shots_to_kill < best_shots_to_kill )
-					best_shots_to_kill = shots_to_kill;
-
-				aimpoint = trace_aimpoint;
-				return false;
-			};
-
-			if ( overwrite_point() )
-				break;
+			overwrite_point();
 		}
 	}
 
-	if ( has_safepoint )
+	if (has_safepoint)
 		aimpoint.has_safe_point = true;
 
-	//extra_info += xorstr_( "chosen: \n" );
-	//extra_info += "[ " + std::to_string( aimpoint.hitbox ) + " " + std::to_string( aimpoint.damage ) + " " + std::to_string( aimpoint.safety ) + " " + std::to_string( aimpoint.safety_size ) + " " + std::to_string( aimpoint.center_dist ) + " ]\n";
-	//aimpoint.extra_info = extra_info;
 	aimpoint.highest_damage = highest_damage;
-
 	return aimpoint;
 }
 
@@ -391,6 +345,7 @@ void hitscan::multipoint_hitbox(circular_buffer<aimbot::aimpoint_t, 78>& points,
 
 	const auto player = globals::get_player(record.m_index);
 	const auto is_bot = player->get_player_info().fakeplayer;
+	constexpr size_t k_points_cap = 78;
 
 	if (is_bot)
 		safety = penetration::safety_none;
@@ -404,6 +359,10 @@ void hitscan::multipoint_hitbox(circular_buffer<aimbot::aimpoint_t, 78>& points,
 
 	auto center = (vmin + vmax) * 0.5f;
 
+	// Head: bias center toward top of capsule (less neck)
+	if (index == HITBOX_HEAD)
+		center = math::lerp(vmin, vmax, 0.65f);
+
 	const auto cur_angles = math::calc_angle(eyepos, center);
 	Vector forward{};
 	math::angle_vectors(cur_angles, &forward);
@@ -412,6 +371,8 @@ void hitscan::multipoint_hitbox(circular_buffer<aimbot::aimpoint_t, 78>& points,
 	{
 		const auto radius = hitbox->radius == -1 ? 3.f : hitbox->radius;
 		const auto back = forward * -radius * 0.975f;
+		if (points.size() >= k_points_cap)
+			return;
 		const auto point = points.emplace_back(center + back, center, index, hitbox->group);
 		point->safety = penetration::safety_full;
 		return;
@@ -433,6 +394,8 @@ void hitscan::multipoint_hitbox(circular_buffer<aimbot::aimpoint_t, 78>& points,
 	{
 		if (safety == penetration::safety_none)
 		{
+			if (points.size() >= k_points_cap)
+				return;
 			const auto point = points.emplace_back(center, center, index, hitbox->group);
 			point->no_pen_damage = minimum_damage;
 			point->center_dist = 0.f;
@@ -442,6 +405,7 @@ void hitscan::multipoint_hitbox(circular_buffer<aimbot::aimpoint_t, 78>& points,
 		return;
 	}
 
+	// ----- point scale -----
 	auto rs = 0.975f;
 
 	log.m_shots = std::max(0, log.m_shots);
@@ -468,7 +432,12 @@ void hitscan::multipoint_hitbox(circular_buffer<aimbot::aimpoint_t, 78>& points,
 	if (!is_zeus && !pointscale_hitboxes[index])
 		rs = 0.f;
 
+	// Floor for multipoint; 0 means center-only
 	rs = clamp(rs, 0.f, 0.975f);
+	if (rs > 0.f)
+		rs = std::max(rs, 0.2f);
+
+	const float rs_safe = (rs > 0.f) ? std::max(rs * 0.8f, 0.2f) : 0.f;
 
 	auto use_extra = extra && record.m_extrapolate_amt;
 	auto safe_legs = record.m_velocity.Length2D() < 1.f || !(record.m_flags & FL_ONGROUND);
@@ -508,16 +477,21 @@ void hitscan::multipoint_hitbox(circular_buffer<aimbot::aimpoint_t, 78>& points,
 				|| j == resolver_direction::resolver_max_extra && !is_extra_record))
 				continue;
 
-			const auto out2 = is_extra_record ? extra->matrix(j)[hitbox->bone] : is_extra_matrix ? record.extra_matrix(j)[hitbox->bone] : record.matrix(j)[hitbox->bone];
+			const auto out2 = is_extra_record ? extra->matrix(j)[hitbox->bone]
+				: is_extra_matrix ? record.extra_matrix(j)[hitbox->bone]
+				: record.matrix(j)[hitbox->bone];
 			Vector vmin2{}, vmax2{};
 			math::vector_transform(hitbox->bbmin, out2, vmin2);
 			math::vector_transform(hitbox->bbmax, out2, vmax2);
 
 			auto& proj = projected_points[i][static_cast<int>(j)];
-			proj.reserve(24);
+			// fixed capacity — do not rely on grow-on-reserve
+			proj.clear();
 
 			const auto add_circle_points = [&](const Vector& dir)
 				{
+					if (proj.size() + 2 > k_points_cap)
+						return;
 					proj.emplace_back(vmin2 + dir);
 					proj.emplace_back(vmax2 + dir);
 				};
@@ -549,13 +523,17 @@ void hitscan::multipoint_hitbox(circular_buffer<aimbot::aimpoint_t, 78>& points,
 			}
 
 			auto& mapped = mapped_points[i][static_cast<int>(j)];
-			mapped.resize(24);
+			mapped.clear();
+			if (projected_points[0][static_cast<int>(resolver_direction::resolver_networked)].empty())
+				continue;
 
 			const auto p0 = projected_points[0][static_cast<int>(resolver_direction::resolver_networked)][0];
 			for (size_t k = 0; k < proj.size(); k++)
 			{
+				if (mapped.size() >= k_points_cap)
+					break;
 				auto& p = proj[k];
-				mapped[k] = Vector{ (p - p0).Dot(u), (p - p0).Dot(v), 0.f };
+				mapped.emplace_back(Vector{ (p - p0).Dot(u), (p - p0).Dot(v), 0.f });
 			}
 
 			poly_intersect::graham_scan(mapped);
@@ -577,16 +555,16 @@ void hitscan::multipoint_hitbox(circular_buffer<aimbot::aimpoint_t, 78>& points,
 				return top;
 
 			Vector point = top;
+			const auto studio_model = interfaces::model_info()->GetStudioModel(player->get_model());
+			const auto hitbox_set = studio_model->pHitboxSet(player->get_hitbox_set());
+
+			matrix3x4_t* hitboxbones[128];
+			for (auto j = 0; j < 128; j++)
+				hitboxbones[j] = &record.matrix(resolve_dir)[j];
+
 			for (auto i = 0u; i < 6; i++)
 			{
 				point = math::lerp(top, bot, i / 6.f);
-
-				const auto studio_model = interfaces::model_info()->GetStudioModel(player->get_model());
-				const auto hitbox_set = studio_model->pHitboxSet(player->get_hitbox_set());
-
-				matrix3x4_t* hitboxbones[128];
-				for (auto j = 0; j < 128; j++)
-					hitboxbones[j] = &record.matrix(resolve_dir)[j];
 
 				auto direction = point - eyepos;
 				math::fast_vec_normalize(direction);
@@ -598,22 +576,19 @@ void hitscan::multipoint_hitbox(circular_buffer<aimbot::aimpoint_t, 78>& points,
 					break;
 			}
 
-			// Bias toward top of the valid segment (less neck)
 			return math::lerp(point, top, 0.65f);
 		};
 
-	// Minimum polygon area (2D mapped space) before we accept a safety tier
 	constexpr float k_min_area_no_roll = 6.f;
 	constexpr float k_min_area_full = 12.f;
 
-	const auto extract_points = [&](poly_intersect::convex_polygon& intersect, int safety_tier) -> bool
+	const auto extract_points = [&](poly_intersect::convex_polygon& intersect, int safety_tier, float scale) -> bool
 		{
 			if (intersect.size() < 3)
 				return false;
 
 			const float area = poly_intersect::area(intersect);
 
-			// Collapsed hull → refuse this safety tier (caller keeps lower-tier points)
 			if (safety_tier == penetration::safety_full && area < k_min_area_full)
 				return false;
 			if (safety_tier == penetration::safety_no_roll && area < k_min_area_no_roll)
@@ -636,23 +611,25 @@ void hitscan::multipoint_hitbox(circular_buffer<aimbot::aimpoint_t, 78>& points,
 					bottommost = p;
 			}
 
-			// Head: bias center upward so multipoints don't collapse toward neck
+			Vector poly_center;
 			if (index == HITBOX_HEAD)
-				center = (leftmost + rightmost + bottommost + topmost + topmost) / 5.f;
+				poly_center = (leftmost + rightmost + bottommost + topmost + topmost) / 5.f;
 			else
-				center = (leftmost + rightmost + bottommost + topmost) / 4.f;
+				poly_center = (leftmost + rightmost + bottommost + topmost) / 4.f;
+
+			const float use_rs = scale;
 
 			std::array intersection{
-				point_to_world(math::lerp(center, leftmost, rs)),
-				point_to_world(math::lerp(center, rightmost, rs)),
+				point_to_world(math::lerp(poly_center, leftmost, use_rs)),
+				point_to_world(math::lerp(poly_center, rightmost, use_rs)),
 				index == HITBOX_HEAD
-					? point_to_world(math::lerp(center, topmost, rs))
-					: point_to_world(center)
+					? point_to_world(math::lerp(poly_center, topmost, use_rs))
+					: point_to_world(poly_center)
 			};
 
 			const auto new_center = extra_head_calc(
 				intersection.back(),
-				point_to_world(math::lerp(center, bottommost, rs)));
+				point_to_world(math::lerp(poly_center, bottommost, use_rs)));
 
 			auto safety_size = safety_tier == penetration::safety_none ? 0.f : area;
 			if (index == HITBOX_HEAD)
@@ -660,32 +637,32 @@ void hitscan::multipoint_hitbox(circular_buffer<aimbot::aimpoint_t, 78>& points,
 			else if (index == HITBOX_UPPER_CHEST)
 				safety_size *= 0.2f;
 
-			if (rs < 0.2f || index == HITBOX_HEAD)
-			{
-				const auto point = points.emplace_back(new_center, new_center, index, hitbox->group);
-				point->no_pen_damage = minimum_damage;
-				point->center_dist = 0.f;
-				point->safety = is_bot ? penetration::safety_full : safety_tier;
-				point->safety_size = is_bot ? 10.f : safety_size;
-			}
-
-			if (rs >= 0.2f)
-			{
-				for (auto& p : intersection)
+			auto emplace_pt = [&](const Vector& p, const Vector& ctr, float cdist)
 				{
-					const auto point = points.emplace_back(p, new_center, index, hitbox->group);
+					if (points.size() >= k_points_cap)
+						return;
+					const auto point = points.emplace_back(p, ctr, index, hitbox->group);
 					point->no_pen_damage = minimum_damage;
-					point->center_dist = p.DistToSqr(new_center);
+					point->center_dist = cdist;
 					point->safety = is_bot ? penetration::safety_full : safety_tier;
 					point->safety_size = is_bot ? 10.f : safety_size;
-				}
+				};
+
+			if (use_rs < 0.2f || index == HITBOX_HEAD)
+				emplace_pt(new_center, new_center, 0.f);
+
+			if (use_rs >= 0.2f)
+			{
+				for (auto& p : intersection)
+					emplace_pt(p, new_center, p.DistToSqr(new_center));
 			}
 
 			return true;
 		};
 
-	// ----- Aim points on resolved dir (unsafed) -----
-	if (safety == penetration::safety_none && (index != HITBOX_HEAD || !config::current_config(local_weapon)->baim.high_risk->get<bool>() || is_bot || vars::aim.headshot_only()))
+	// ----- Aim points on resolved dir -----
+	if (safety == penetration::safety_none
+		&& (index != HITBOX_HEAD || !config::current_config(local_weapon)->baim.high_risk->get<bool>() || is_bot || vars::aim.headshot_only()))
 	{
 		auto intersect = record.m_last_ang_differs
 			? poly_intersect::get_intersection_poly(
@@ -693,16 +670,14 @@ void hitscan::multipoint_hitbox(circular_buffer<aimbot::aimpoint_t, 78>& points,
 				mapped_points[1][static_cast<int>(resolve_dir)])
 			: mapped_points[0][static_cast<int>(resolve_dir)];
 
-		if (!extract_points(intersect, penetration::safety_none))
+		if (!extract_points(intersect, penetration::safety_none, rs))
 			return;
 	}
 
 	if (is_bot || (index == HITBOX_LEFT_CALF || index == HITBOX_RIGHT_CALF || index == HITBOX_LEFT_FOOT || index == HITBOX_RIGHT_FOOT) && !safe_legs)
 		return;
 
-	rs *= 0.8f;
-
-	// ----- no_roll: min ∩ max only (primary body sides) -----
+	// ----- no_roll: min ∩ max -----
 	auto intersect = mapped_points[0][static_cast<int>(resolver_direction::resolver_min)];
 	intersect = poly_intersect::get_intersection_poly(intersect, mapped_points[0][static_cast<int>(resolver_direction::resolver_max)]);
 
@@ -719,9 +694,9 @@ void hitscan::multipoint_hitbox(circular_buffer<aimbot::aimpoint_t, 78>& points,
 	}
 
 	if (safety != penetration::safety_full)
-		extract_points(intersect, penetration::safety_no_roll);
+		extract_points(intersect, penetration::safety_no_roll, rs_safe);
 
-	// ----- full: add extremes; skip if hull collapses -----
+	// ----- full: extremes; reject if hull collapses -----
 	auto full = intersect;
 	full = poly_intersect::get_intersection_poly(full, mapped_points[0][static_cast<int>(resolver_direction::resolver_min_min)]);
 	full = poly_intersect::get_intersection_poly(full, mapped_points[0][static_cast<int>(resolver_direction::resolver_max_max)]);
@@ -742,8 +717,7 @@ void hitscan::multipoint_hitbox(circular_buffer<aimbot::aimpoint_t, 78>& points,
 		full = poly_intersect::get_intersection_poly(full, mapped_points[2][static_cast<int>(resolver_direction::resolver_max_max)]);
 	}
 
-	// If this returns false, we keep no_roll / resolve-dir points — no neck magnets
-	extract_points(full, penetration::safety_full);
+	extract_points(full, penetration::safety_full, rs_safe);
 }
 
 void hitscan::create_local_record( bool extrapolate )
