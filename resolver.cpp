@@ -287,6 +287,52 @@ void resolver::pitch_resolve( lag_record_t* record )
 	record->m_pitch_cycle = log.nospread.m_pitch_cycle;
 }
 
+resolver_direction resolver::live_dir(player_log_t& log)
+{
+	auto dir = log.m_mode[resolver_mode::resolver_default]
+		.m_side[log.m_current_side]
+		.m_current_dir;
+
+	const auto& j = log.m_jitter;
+	const auto& a = log.m_anim;
+
+	const float efd_hold = a.is_crouching ? 14.f : 22.f;
+	const bool held_desync = fabsf(a.eye_feet_delta) >= efd_hold;
+
+	// Same gate as yaw_resolve use_networked
+	const bool jitter_center =
+		dir == resolver_direction::resolver_networked
+		&& j.is_bimodal
+		&& j.sample_count >= j.MIN_SAMPLES
+		&& a.on_ground
+		&& !held_desync
+		&& !a.defensive_flick;
+
+	if (jitter_center)
+		return resolver_direction::resolver_networked;
+
+	// Stale / invalid only — not intentional networked
+	if (dir != resolver_direction::resolver_networked
+		&& dir >= resolver_direction::resolver_networked
+		&& dir < resolver_direction::resolver_direction_max)
+		return dir;
+
+	const float abs_efd = fabsf(a.eye_feet_delta);
+	const bool left = (log.m_current_side == resolver_side::resolver_left);
+	constexpr float gate = 27.f;
+
+	dir = (abs_efd > gate)
+		? (left ? resolver_direction::resolver_min_extra
+			: resolver_direction::resolver_max_extra)
+		: (left ? resolver_direction::resolver_min
+			: resolver_direction::resolver_max);
+
+	log.m_mode[resolver_mode::resolver_default]
+		.m_side[log.m_current_side]
+		.m_current_dir = dir;
+
+	return dir;
+}
 
 float resolver::get_resolver_angle( const lag_record_t& record, resolver_direction direction, float eye_angle )
 {
@@ -331,13 +377,15 @@ void resolver::update_anim_info(player_log_t& log, lag_record_t* record, lag_rec
 	a.prev_eye_yaw = a.eye_yaw;
 
 	// ----- layers -----
+	// 3 = ADJUST, 6 = MOVEMENT_MOVE, 7 = STRAFECHANGE
+	// 8 = WHOLE_BODY, 12 = LEAN
 	a.layer3_weight = layers[3].m_flWeight;
 	a.layer3_cycle = layers[3].m_flCycle;
 	a.layer6_weight = layers[6].m_flWeight;
 	a.layer6_cycle = layers[6].m_flCycle;
 	a.layer7_weight = layers[7].m_flWeight;
 	a.layer7_cycle = layers[7].m_flCycle;
-	a.layer12_weight = layers[12].m_flWeight;
+	a.layer12_weight = layers[12].m_flWeight; // lean (diagnostics)
 	a.layer12_cycle = layers[12].m_flCycle;
 
 	a.layer3_weight_delta = fabsf(a.layer3_weight - a.prev_layer3_weight);
@@ -373,8 +421,8 @@ void resolver::update_anim_info(player_log_t& log, lag_record_t* record, lag_rec
 	a.speed_2d = vel.Length2D();
 	a.on_ground = (record->m_flags & FL_ONGROUND) != 0;
 	a.is_moving = a.speed_2d > 5.f;
-	a.is_crouching = record->m_duckamt > 0.5f;
 	a.is_standing = !a.is_moving && a.on_ground;
+	a.is_crouching = record->m_duckamt > 0.5f;
 	a.choke = record->m_lagamt;
 
 	if (a.is_standing)
@@ -393,6 +441,27 @@ void resolver::update_anim_info(player_log_t& log, lag_record_t* record, lag_rec
 		a.velocity_yaw_delta = 0.f;
 	}
 
+	const int cur_tick = interfaces::client_state()->get_last_server_tick();
+
+	// ----- peek edge -----
+	Vector forward{}, right{};
+	math::angle_vectors(QAngle(0.f, a.eye_yaw, 0.f), &forward, &right, nullptr);
+	const float lateral = a.is_moving ? vel.Dot(right) : 0.f;
+
+	const bool peek_started =
+		a.on_ground &&
+		!a.is_crouching &&
+		a.choke <= 1 &&
+		fabsf(lateral) > 45.f &&
+		fabsf(a.prev_lateral_speed) < 5.f &&
+		a.speed_2d > 50.f &&
+		(cur_tick - log.m_peek_tick > time_to_ticks(0.3f));
+
+	if (peek_started)
+		log.m_peek_tick = cur_tick;
+
+	a.prev_lateral_speed = lateral;
+
 	// ----- break flags -----
 	a.layer7_strafe_break =
 		a.layer7_weight > 0.50f ||
@@ -408,13 +477,14 @@ void resolver::update_anim_info(player_log_t& log, lag_record_t* record, lag_rec
 		a.layer3_cycle_delta > 0.30f;
 
 	// =========================================================================
-	// Jitter / body-yaw sampling (+ bimodal tracking)
+	// Jitter / body-yaw sampling (+ dual clusters)
 	// =========================================================================
-	const bool whole_body_idle = a.layer12_weight < 0.25f;
+	// WHOLE_BODY (8), not LEAN (12)
+	const bool whole_body_idle = layers[8].m_flWeight < 0.25f;
 
 	const bool l3_commit =
 		a.layer3_weight > 0.01f &&
-		(a.layer3_cycle_delta > 0.12f || a.layer3_weight_delta > 0.20f || a.layer3_break);
+		(a.layer3_cycle_delta > 0.12f || a.layer3_weight_delta > 0.20f);
 
 	const bool standing_desync_sample =
 		a.is_standing &&
@@ -422,22 +492,48 @@ void resolver::update_anim_info(player_log_t& log, lag_record_t* record, lag_rec
 		whole_body_idle &&
 		fabsf(a.eye_feet_delta) > 12.f;
 
-	const int cur_tick = interfaces::client_state()->get_last_server_tick();
 	const bool weak_ok =
 		standing_desync_sample &&
 		(cur_tick - a.last_weak_sample_tick >= 2);
 
-	const bool should_sample =
+	const bool lby_sample =
+		a.lby_snapped &&
+		a.choke <= 1 &&
+		fabsf(a.eye_feet_delta) > 12.f &&
+		whole_body_idle;
+
+	const bool moving_jitter_sample =
+		a.is_moving &&
+		a.on_ground &&
+		whole_body_idle &&
+		a.layer6_weight > 0.05f &&
+		(a.layer6_break
+			|| a.layer6_cycle_delta > 0.08f
+			|| feet_snap > 8.f);
+
+	const bool standing_sample =
 		a.is_standing &&
 		whole_body_idle &&
-		((l3_commit || a.lby_snapped) || weak_ok);
+		(l3_commit || lby_sample || weak_ok);
+
+	// Defensive stand flick: huge eye delta + pitch near 0 while planted
+	const bool defensive_flick =
+		a.is_standing
+		&& a.standing_ticks >= 2
+		&& fabsf(a.eye_yaw_delta) > 60.f
+		&& fabsf(record->m_eye_angles.x) < 15.f;
+
+	const bool should_sample = standing_sample || moving_jitter_sample;
 
 	if (should_sample)
 	{
-		if (weak_ok && !(l3_commit || a.lby_snapped))
+		if (weak_ok)
 			a.last_weak_sample_tick = cur_tick;
 
-		const float sample = a.eye_yaw;
+		const float sample = a.feet_yaw;
+
+		// Clusters only from standing feet (move feet ≈ velocity)
+		const bool update_clusters = standing_sample;
 
 		if (j.sample_count == 0)
 		{
@@ -446,39 +542,105 @@ void resolver::update_anim_info(player_log_t& log, lag_record_t* record, lag_rec
 			j.last_delta_sign = 0;
 			j.sign_flip_count = 0;
 			j.is_bimodal = false;
+			j.cluster_lo = sample;
+			j.cluster_hi = sample;
+			j.weight_lo = 1.f;
+			j.weight_hi = 1.f;
+			j.clusters_init = true;
 		}
 		else
 		{
-			float delta = sample - j.ewma;
-			while (delta > 180.f)  delta -= 360.f;
-			while (delta < -180.f) delta += 360.f;
+			const float delta = math::angle_diff(sample, j.ewma);
+			const int cur_sign = (delta > 1.f) ? 1 : (delta < -1.f ? -1 : 0);
 
-			const int cur_sign = (delta > 0.f) ? 1 : (delta < 0.f ? -1 : 0);
-			if (cur_sign != 0 && j.last_delta_sign != 0)
+			if (update_clusters &&
+				cur_sign != 0 && j.last_delta_sign != 0 && cur_sign != j.last_delta_sign)
 			{
-				if (cur_sign != j.last_delta_sign)
-					j.sign_flip_count++;
-				else
-					j.sign_flip_count = std::max(0, j.sign_flip_count - 2);
+				j.sign_flip_count++;
 			}
+
 			if (cur_sign != 0)
 				j.last_delta_sign = cur_sign;
 
-			j.is_bimodal = j.sign_flip_count >= 3;
-
-			j.ewma += j.ALPHA * delta;
-			while (j.ewma > 180.f)  j.ewma -= 360.f;
-			while (j.ewma < -180.f) j.ewma += 360.f;
-
+			j.ewma = math::normalize_float(j.ewma + j.ALPHA * delta);
 			j.ewm_var = (1.f - j.ALPHA) * (j.ewm_var + j.ALPHA * delta * delta);
+
+			if (update_clusters)
+			{
+				if (!j.clusters_init)
+				{
+					j.cluster_lo = sample;
+					j.cluster_hi = sample;
+					j.weight_lo = 1.f;
+					j.weight_hi = 1.f;
+					j.clusters_init = true;
+				}
+				else
+				{
+					const float d_lo = fabsf(math::angle_diff(sample, j.cluster_lo));
+					const float d_hi = fabsf(math::angle_diff(sample, j.cluster_hi));
+					const float sep = fabsf(math::angle_diff(j.cluster_hi, j.cluster_lo));
+
+					if (sep < 15.f && (d_lo > 20.f || d_hi > 20.f))
+					{
+						if (d_lo >= d_hi)
+						{
+							j.cluster_hi = sample;
+							j.weight_hi = 1.f;
+							j.weight_lo = 1.f;
+						}
+						else
+						{
+							j.cluster_lo = sample;
+							j.weight_lo = 1.f;
+							j.weight_hi = 1.f;
+						}
+					}
+					else if (d_lo <= d_hi)
+					{
+						const float w = std::min(j.weight_lo, 20.f);
+						const float t = 1.f / (w + 1.f);
+						j.cluster_lo = math::normalize_float(
+							j.cluster_lo + math::angle_diff(sample, j.cluster_lo) * t);
+						j.weight_lo = w + 1.f;
+					}
+					else
+					{
+						const float w = std::min(j.weight_hi, 20.f);
+						const float t = 1.f / (w + 1.f);
+						j.cluster_hi = math::normalize_float(
+							j.cluster_hi + math::angle_diff(sample, j.cluster_hi) * t);
+						j.weight_hi = w + 1.f;
+					}
+
+					if (math::angle_diff(j.cluster_hi, j.cluster_lo) < 0.f)
+					{
+						std::swap(j.cluster_lo, j.cluster_hi);
+						std::swap(j.weight_lo, j.weight_hi);
+					}
+				}
+
+				const float separation = fabsf(math::angle_diff(j.cluster_hi, j.cluster_lo));
+
+				if (!j.is_bimodal)
+				{
+					j.is_bimodal =
+						j.sample_count >= j.MIN_SAMPLES &&
+						separation > 25.f &&
+						j.sign_flip_count >= 2;
+				}
+				else
+				{
+					j.is_bimodal = separation > 18.f;
+				}
+			}
 		}
 
 		j.last_commit_yaw = sample;
 		j.last_commit_tick = cur_tick;
 		j.sample_count = std::min(j.sample_count + 1, 64);
-		// confidence is computed only in yaw_resolve
 	}
-}
+}	
 
 void resolver::yaw_resolve(const lag_record_t* record, const lag_record_t* previous)
 {
@@ -490,200 +652,237 @@ void resolver::yaw_resolve(const lag_record_t* record, const lag_record_t* previ
 	auto& j = log.m_jitter;
 
 	const bool in_air = !a.on_ground;
-	const bool crouching = a.is_crouching;
-	const bool grounded_crouch = a.on_ground && crouching;
-	const bool air_crouch = in_air && crouching;
+	const bool grounded_crouch = a.on_ground && a.is_crouching;
+	const bool air_crouch = in_air && a.is_crouching;
+	const bool low_speed_static =
+		a.on_ground
+		&& !a.is_moving
+		&& a.standing_ticks >= 3;
 
-	// =========================================================================
-	// 1. MODE
-	// =========================================================================
-	const auto previous_mode = log.m_current_mode;
+	const bool cold_start = (log.m_shots == 0 && log.m_unknown_misses == 0);
+	const bool no_feedback = log.m_unknown;
 
-	const bool big_eye_turn = fabsf(a.eye_yaw_delta) > 30.f;
-	const bool huge_eye_turn = fabsf(a.eye_yaw_delta) > 170.f;
-	const bool anim_break =
-		a.layer7_strafe_break ||
-		a.layer6_break ||
-		a.layer3_break ||
-		a.lby_snapped;
+	log.m_current_mode = resolver_mode::resolver_default;
 
-	// Grounded crouch: damp small mode flips (stable angle holds)
-	const float flip_eye = grounded_crouch ? 40.f : 30.f;
-	const float flip_break_eye = grounded_crouch ? 18.f : 10.f;
+	const auto& st = record->m_state[resolver_direction::resolver_networked].m_animstate;
+	const float max_yaw = std::max(fabsf(st.aim_yaw_max), fabsf(st.aim_yaw_min));
+	const float extra_gate = (max_yaw > 10.f && max_yaw < 90.f)
+		? max_yaw * 0.5f
+		: 28.f;
 
-	const bool want_flip =
-		(a.eye_yaw_delta > flip_eye) ||
-		(anim_break && a.eye_yaw_delta > flip_break_eye);
+	const float efd_hold = grounded_crouch ? 14.f : 22.f;
+	const bool held_desync = fabsf(a.eye_feet_delta) >= efd_hold;
 
-	const bool want_nonflip =
-		(a.eye_yaw_delta < -flip_eye) ||
-		(anim_break && a.eye_yaw_delta < -flip_break_eye);
+	const bool use_networked =
+		a.on_ground
+		&& j.is_bimodal
+		&& j.sample_count >= j.MIN_SAMPLES
+		&& !held_desync
+		&& !a.defensive_flick;
 
-	if ((log.m_current_mode == resolver_mode::resolver_flip && want_nonflip) ||
-		(log.m_current_mode == resolver_mode::resolver_default && want_flip))
+	auto pick_from_side = [extra_gate, use_networked](resolver_side side, float abs_efd, bool allow_extra) -> resolver_direction
+		{
+			// Symmetric jitter / weak desync → center
+			if (use_networked)
+				return resolver_direction::resolver_networked;
+
+			const bool left = (side == resolver_side::resolver_left);
+
+			if (allow_extra && abs_efd > extra_gate)
+				return left ? resolver_direction::resolver_min_extra
+				: resolver_direction::resolver_max_extra;
+
+			return left ? resolver_direction::resolver_min
+				: resolver_direction::resolver_max;
+		};
+
+	auto set_side = [&](resolver_side candidate, float quality) -> bool
+		{
+			if (cold_start)
+			{
+				log.m_current_side = candidate;
+				return true;
+			}
+
+			if (candidate == log.m_current_side)
+				return quality >= 0.20f;
+
+			float need = no_feedback ? 0.45f : 0.65f;
+			if (a.is_standing && a.standing_ticks >= 3)
+				need = std::max(need, 0.70f);
+			if (a.defensive_flick)
+				need = 0.95f;
+
+			if (quality >= need)
+			{
+				log.m_current_side = candidate;
+				return true;
+			}
+
+			return false;
+		};
+
+	// Flick: freeze side, base only (pick_from_side still base via allow_extra=false;
+	// use_networked already false when defensive_flick)
+	if (a.defensive_flick && !cold_start)
 	{
-		log.m_current_mode = static_cast<resolver_mode>(!static_cast<int>(log.m_current_mode));
+		auto& slot = log.m_mode[resolver_mode::resolver_default]
+			.m_side[log.m_current_side];
+		slot.m_current_dir = pick_from_side(
+			log.m_current_side, fabsf(a.eye_feet_delta), false);
+		return;
 	}
-	else if (huge_eye_turn || (anim_break && big_eye_turn && !grounded_crouch))
-	{
-		log.m_current_mode = static_cast<resolver_mode>(!static_cast<int>(log.m_current_mode));
-	}
 
-	if (previous_mode != log.m_current_mode)
-		log.m_last_flip_tick = interfaces::client_state()->get_last_server_tick();
-
-	if (interfaces::client_state()->get_last_server_tick() - log.m_last_flip_tick > time_to_ticks(1.1f))
-		log.m_current_mode = resolver_mode::resolver_default;
-
-	// =========================================================================
-	// 2. SIDE — wall > air > jitter (ground stand) > crouch/stand eye_feet
-	// =========================================================================
 	bool side_set = false;
 
-	// 2a. Wall always wins when decisive
-	if (log.m_wall_side_valid)
-		side_set = true;
-
-	// 2b. Air (including air + crouch): no jitter — move/eye + keep last side
-	if (!side_set && in_air)
+	// =========================================================================
+	// 1) CLUSTERS — soft assist
+	// =========================================================================
+	if (!use_networked && a.on_ground && j.clusters_init && j.sample_count >= 2)
 	{
-		float side_signal = a.eye_feet_delta * 0.35f + a.velocity_yaw_delta * 0.65f;
+		const float sep = fabsf(math::angle_diff(j.cluster_hi, j.cluster_lo));
 
-		// Air crouch: slightly more weight on eye_feet (less pure strafe)
-		if (air_crouch)
-			side_signal = a.eye_feet_delta * 0.50f + a.velocity_yaw_delta * 0.50f;
+		const bool usable =
+			sep > 35.f
+			|| (j.is_bimodal && sep > 22.f);
 
-		constexpr float AIR_DEADZONE = 8.f;
-		if (fabsf(side_signal) >= AIR_DEADZONE)
+		if (usable)
 		{
-			log.m_current_side = (side_signal < 0.f)
-				? resolver_side::resolver_left
-				: resolver_side::resolver_right;
-		}
-		// else keep previous m_current_side (last grounded / last vote)
-		side_set = true;
-	}
+			const float eye = record->m_eye_angles.y;
+			const float d_lo = fabsf(math::angle_diff(eye, j.cluster_lo));
+			const float d_hi = fabsf(math::angle_diff(eye, j.cluster_hi));
+			const float body = (d_hi > d_lo) ? j.cluster_hi : j.cluster_lo;
+			const float offset = math::angle_diff(eye, body);
 
-	// 2c. Jitter (ground only — standing or crouch-stand)
-	if (!side_set && a.on_ground && j.sample_count >= j.MIN_SAMPLES)
-	{
-		const int ticks_since =
-			interfaces::client_state()->get_last_server_tick() - j.last_commit_tick;
-
-		const float recency_conf = 1.f - clamp(
-			static_cast<float>(ticks_since) / static_cast<float>(j.COMMIT_FRESH_TICKS),
-			0.f, 1.f);
-
-		float body_yaw = j.ewma;
-		bool  can_use = false;
-
-		if (j.is_bimodal)
-		{
-			const float spread = sqrtf(std::max(j.ewm_var, 1.f));
-			const float cluster_hi = math::normalize_float(j.ewma + spread);
-			const float cluster_lo = math::normalize_float(j.ewma - spread);
-
-			const float diff_hi = fabsf(math::angle_diff(record->m_eye_angles.y, cluster_hi));
-			const float diff_lo = fabsf(math::angle_diff(record->m_eye_angles.y, cluster_lo));
-
-			body_yaw = (diff_hi > diff_lo) ? cluster_hi : cluster_lo;
-
-			j.confidence = std::min(1.f, 0.45f + 0.1f * static_cast<float>(j.sign_flip_count))
-				* std::max(recency_conf, 0.1f);
-
-			can_use = recency_conf > 0.15f;
-		}
-		else
-		{
-			const float sigma = sqrtf(std::max(j.ewm_var, 0.f));
-			const float var_conf = 1.f - clamp(sigma / 70.f, 0.f, 1.f);
-			j.confidence = std::max(0.15f, var_conf) * std::max(recency_conf, 0.1f);
-
-			const float blend_t = clamp(
-				static_cast<float>(ticks_since) / static_cast<float>(j.COMMIT_FRESH_TICKS),
-				0.f, 1.f);
-			body_yaw = math::lerp(j.last_commit_yaw, j.ewma, blend_t);
-
-			can_use = j.confidence >= 0.20f;
-		}
-
-		// Full crouch hold: only use jitter if fairly confident (anim is cleaner)
-		if (grounded_crouch && j.confidence < 0.30f)
-			can_use = false;
-
-		if (can_use)
-		{
-			const float offset = math::angle_diff(record->m_eye_angles.y, body_yaw);
-			const float deadzone = grounded_crouch ? 3.5f : 5.f;
-
-			if (fabsf(offset) >= deadzone)
+			if (fabsf(offset) >= 2.5f)
 			{
-				log.m_current_side = (offset > 0.f)
+				const auto cand = (offset > 0.f)
 					? resolver_side::resolver_right
 					: resolver_side::resolver_left;
-				side_set = true;
+
+				const float pole_clear = clamp(fabsf(d_hi - d_lo) / 30.f, 0.f, 1.f);
+				const float sep_q = clamp(sep / 50.f, 0.f, 1.f);
+
+				float quality = 0.55f * sep_q + 0.45f * pole_clear;
+				// Cap so poles stay assist-level
+				quality = std::min(quality, 0.72f);
+				if (sep > 70.f)
+					quality = std::min(std::max(quality, 0.70f), 0.72f);
+
+				if (set_side(cand, quality))
+					side_set = true;
 			}
 		}
 	}
 
-	// 2d. Ground eye / feet (stand or crouch)
-	if (!side_set)
+	// =========================================================================
+	// 2) AIR
+	// =========================================================================
+	if (!side_set && !use_networked && in_air)
 	{
-		float side_signal = a.eye_feet_delta;
-		float deadzone = 5.f;
+		float signal;
+		float quality;
 
-		if (a.is_moving && a.speed_2d > 20.f)
+		if (a.speed_2d <= 5.f || fabsf(a.eye_feet_delta) > 15.f)
 		{
-			side_signal = a.eye_feet_delta * 0.55f + a.velocity_yaw_delta * 0.45f;
-			deadzone = 6.f;
+			signal = a.eye_feet_delta;
+			quality = clamp(fabsf(signal) / 25.f, 0.f, 0.75f);
+		}
+		else
+		{
+			const float vyd_w = (a.speed_2d > 40.f) ? 0.45f : 0.25f;
+			signal = a.eye_feet_delta * (1.f - vyd_w) + a.velocity_yaw_delta * vyd_w;
+			quality = clamp(a.speed_2d / 120.f, 0.2f, 0.7f)
+				* clamp(fabsf(signal) / 30.f, 0.f, 1.f);
+			if (air_crouch)
+				quality *= 0.9f;
 		}
 
-		// Grounded crouch: tighter deadzone, pure eye_feet
-		if (grounded_crouch)
+		if (fabsf(signal) >= (cold_start ? 1.f : 5.f))
 		{
-			side_signal = a.eye_feet_delta;
-			deadzone = 3.5f;
-		}
-
-		if (fabsf(side_signal) >= deadzone)
-		{
-			log.m_current_side = (side_signal < 0.f)
+			const auto cand = (signal < 0.f)
 				? resolver_side::resolver_left
 				: resolver_side::resolver_right;
+			if (set_side(cand, quality))
+				side_set = true;
 		}
-		side_set = true;
 	}
 
 	// =========================================================================
-	// 3. DIR
+	// 3) GROUND FALLBACK
 	// =========================================================================
-	auto& slot = log.m_mode[log.m_current_mode].m_side[log.m_current_side];
-
-	resolver_direction picked =
-		(log.m_current_side == resolver_side::resolver_left)
-		? resolver_direction::resolver_min
-		: resolver_direction::resolver_max;
-
-	// Strong eye_feet override only when grounded (stand or crouch) — not in air
-	if (a.on_ground && fabsf(a.eye_feet_delta) > (grounded_crouch ? 18.f : 25.f))
+	if (!side_set && !use_networked)
 	{
-		picked = (a.eye_feet_delta < 0.f)
-			? resolver_direction::resolver_min
-			: resolver_direction::resolver_max;
+		float signal = a.eye_feet_delta;
+		float quality = clamp(fabsf(a.eye_feet_delta) / 35.f, 0.f, 0.65f);
+
+		const bool eye_spike =
+			a.is_standing
+			&& fabsf(a.eye_yaw_delta) > 60.f
+			&& fabsf(a.eye_feet_delta) > 40.f;
+
+		if (!eye_spike)
+		{
+			if (a.is_moving && a.speed_2d > 25.f)
+			{
+				if (fabsf(a.eye_feet_delta) >= 12.f)
+				{
+					signal = a.eye_feet_delta;
+					quality = clamp(fabsf(signal) / 30.f, 0.15f, 0.7f);
+				}
+				else
+				{
+					const float vyd_w = clamp((a.speed_2d - 25.f) / 100.f, 0.25f, 0.60f);
+					signal = a.eye_feet_delta * (1.f - vyd_w) + a.velocity_yaw_delta * vyd_w;
+					quality = 0.35f + 0.20f * clamp((a.speed_2d - 25.f) / 125.f, 0.f, 1.f);
+				}
+			}
+
+			if (grounded_crouch && !a.is_moving)
+			{
+				signal = a.eye_feet_delta;
+				quality = clamp(fabsf(signal) / 30.f, 0.f, 0.6f);
+			}
+
+			const float thr = cold_start ? 1.f : (low_speed_static ? 4.f : 6.f);
+
+			if (fabsf(signal) >= thr)
+			{
+				const auto cand = (signal < 0.f)
+					? resolver_side::resolver_left
+					: resolver_side::resolver_right;
+				if (set_side(cand, quality))
+					side_set = true;
+			}
+			else if (cold_start)
+			{
+				log.m_current_side = (a.eye_feet_delta <= 0.f)
+					? resolver_side::resolver_left
+					: resolver_side::resolver_right;
+			}
+		}
 	}
 
-	if (slot.m_blacklist[picked])
-	{
-		const auto opposite =
-			(picked == resolver_direction::resolver_min)
-			? resolver_direction::resolver_max
-			: resolver_direction::resolver_min;
+	// =========================================================================
+	// DIR — all through pick_from_side
+	// =========================================================================
+	const float abs_efd = fabsf(a.eye_feet_delta);
+	const bool allow_extra =
+		fabsf(a.eye_yaw_delta) < 35.f
+		&& !a.defensive_flick
+		&& !use_networked;
 
-		if (!slot.m_blacklist[opposite])
-			picked = opposite;
+	if (!use_networked && a.on_ground && abs_efd > 28.f && allow_extra)
+	{
+		log.m_current_side = (a.eye_feet_delta < 0.f)
+			? resolver_side::resolver_left
+			: resolver_side::resolver_right;
 	}
 
-	slot.m_current_dir = picked;
+	auto& slot = log.m_mode[resolver_mode::resolver_default]
+		.m_side[log.m_current_side];
+
+	slot.m_current_dir = pick_from_side(log.m_current_side, abs_efd, allow_extra);
 }
 
 void resolver::on_createmove()
@@ -1222,7 +1421,7 @@ void resolver::approve_shots( const ClientFrameStage_t& stage )
 		if ( vars::legit_enabled() )
 			continue;
 
-		get_brute_angle( &shot );
+		//get_brute_angle( &shot );
 
 		calc_missed_shots( &shot );
 	}
@@ -1232,7 +1431,7 @@ void resolver::approve_shots( const ClientFrameStage_t& stage )
 	current_hitposes.clear();
 }
 
-void resolver::get_brute_angle(shot_t* shot)
+/*void resolver::get_brute_angle(shot_t* shot)
 {
 	if (!local_player || !local_player->get_alive() || !local_weapon || !shot || shot->record.m_dormant)
 		return;
@@ -1250,14 +1449,13 @@ void resolver::get_brute_angle(shot_t* shot)
 		? resolver_mode::resolver_shot
 		: shot->record.m_resolver_mode;
 	const auto side = shot->record.m_resolver_side;
-	auto& slot = log.m_mode[mode].m_side[side];
+	auto& slot = log.m_mode[mode].m_side[side]; // single cell — no double-write
 
 	const auto tried = shot->record.m_shot_dir;
 
 	const bool resolve_miss = shot->hit && !shot->hurt;
 	const bool registered_hit = shot->hurt;
 
-	// Spread / no registration — leave anim resolve alone
 	if (!resolve_miss && !registered_hit)
 		return;
 
@@ -1268,32 +1466,11 @@ void resolver::get_brute_angle(shot_t* shot)
 				|| d == resolver_direction::resolver_min_min;
 		};
 
-	auto is_max_family = [](resolver_direction d) -> bool
-		{
-			return d == resolver_direction::resolver_max
-				|| d == resolver_direction::resolver_max_extra
-				|| d == resolver_direction::resolver_max_max;
-		};
-
 	auto opposite_primary = [&](resolver_direction d) -> resolver_direction
 		{
-			return is_min_family(d) ? resolver_direction::resolver_max : resolver_direction::resolver_min;
-		};
-
-	auto same_side_deeper = [](resolver_direction d) -> resolver_direction
-		{
-			switch (d)
-			{
-			case resolver_direction::resolver_min:       return resolver_direction::resolver_min_extra;
-			case resolver_direction::resolver_min_extra: return resolver_direction::resolver_min_min;
-			case resolver_direction::resolver_min_min:   return resolver_direction::resolver_min_min;
-
-			case resolver_direction::resolver_max:       return resolver_direction::resolver_max_extra;
-			case resolver_direction::resolver_max_extra: return resolver_direction::resolver_max_max;
-			case resolver_direction::resolver_max_max:   return resolver_direction::resolver_max_max;
-
-			default: return d;
-			}
+			return is_min_family(d)
+				? resolver_direction::resolver_max
+				: resolver_direction::resolver_min;
 		};
 
 	auto first_available = [&](resolver_direction prefer) -> resolver_direction
@@ -1315,7 +1492,6 @@ void resolver::get_brute_angle(shot_t* shot)
 					return d;
 			}
 
-			// opposite family
 			const resolver_direction opp[] = {
 				want_min ? resolver_direction::resolver_max : resolver_direction::resolver_min,
 				want_min ? resolver_direction::resolver_max_extra : resolver_direction::resolver_min_extra,
@@ -1328,7 +1504,7 @@ void resolver::get_brute_angle(shot_t* shot)
 					return d;
 			}
 
-			return prefer;
+			return resolver_direction::resolver_networked;
 		};
 
 	// -------------------------------------------------------------------------
@@ -1339,43 +1515,34 @@ void resolver::get_brute_angle(shot_t* shot)
 		if (tried > resolver_direction::resolver_networked)
 			slot.m_blacklist[tried] = true;
 
-		const bool wall_strong =
-			log.m_wall_side_valid && log.m_wall_confidence >= 0.55f;
+		slot.m_current_dir = first_available(opposite_primary(tried));
 
-		const bool tried_matches_wall =
-			(log.m_current_side == resolver_side::resolver_left && is_min_family(tried)) ||
-			(log.m_current_side == resolver_side::resolver_right && is_max_family(tried));
-
-		resolver_direction next;
-
-		if (wall_strong && tried_matches_wall)
+		if (mode != resolver_mode::resolver_shot && log.m_resolve_lock_ticks <= 0)
 		{
-			// Stay on freestand side — step to a stronger desync on that side
-			next = same_side_deeper(tried);
-
-			if (next == tried || slot.m_blacklist[next])
-				next = opposite_primary(tried);
-		}
-		else
-		{
-			// Weak / no wall, or shot contradicted wall → classic flip
-			next = opposite_primary(tried);
+			log.m_current_side = side;
+			log.m_current_mode = mode;
 		}
 
-		slot.m_current_dir = first_available(next);
+		log.m_resolve_lock_ticks = 12;
 
-		// Keep the other mode's side from going completely stale
-		if (mode != resolver_mode::resolver_shot && log.m_unknown)
+		// Only seed the sibling mode while still unknown
+		if (log.m_unknown
+			&& (mode == resolver_mode::resolver_default || mode == resolver_mode::resolver_flip))
 		{
-			const auto other = static_cast<resolver_mode>((static_cast<int>(mode) + 1) % 2);
+			const auto other = (mode == resolver_mode::resolver_default)
+				? resolver_mode::resolver_flip
+				: resolver_mode::resolver_default;
+
 			auto& other_slot = log.m_mode[other].m_side[side];
 			if (!other_slot.m_blacklist[slot.m_current_dir])
 				other_slot.m_current_dir = slot.m_current_dir;
 		}
+
+		// Leave m_unknown set — miss does not confirm anything
 	}
 
 	// -------------------------------------------------------------------------
-	// Hit — lock what worked
+	// Hit
 	// -------------------------------------------------------------------------
 	if (registered_hit)
 	{
@@ -1384,19 +1551,22 @@ void resolver::get_brute_angle(shot_t* shot)
 			slot.m_blacklist[tried] = false;
 			slot.m_current_dir = tried;
 		}
-	}
+		// else: networked hit — do not stamp networked over a resolved slot
 
-	// -------------------------------------------------------------------------
-	// Unknown flags
-	// -------------------------------------------------------------------------
-	if (slot.m_current_dir != tried || registered_hit)
-	{
+		if (mode != resolver_mode::resolver_shot)
+		{
+			log.m_current_side = side;
+			log.m_current_mode = mode;
+		}
+
+		log.m_resolve_lock_ticks = 0;
+
 		if (mode == resolver_mode::resolver_shot)
 			log.m_unknown_shot = false;
 		else
 			log.m_unknown = false;
 	}
-}
+}*/
 
 void resolver::calc_missed_shots(shot_t* shot)
 {
@@ -1417,63 +1587,36 @@ void resolver::calc_missed_shots(shot_t* shot)
 			case resolver_direction::resolver_max_max:    return "max_max";
 			case resolver_direction::resolver_min_min:    return "min_min";
 			case resolver_direction::resolver_min_extra:  return "min_extra";
-			default:                                      return "unknown";
+			default:                                      return "?";
 			}
 		};
 
 	const auto side_name = [](resolver_side s) -> const char*
 		{
-			switch (s)
-			{
-			case resolver_side::resolver_left:  return "left";
-			case resolver_side::resolver_right: return "right";
-			default:                            return "invalid";
-			}
-		};
-
-	const auto mode_name = [](resolver_mode m) -> const char*
-		{
-			switch (m)
-			{
-			case resolver_mode::resolver_default: return "default";
-			case resolver_mode::resolver_flip:    return "flip";
-			case resolver_mode::resolver_shot:    return "shot";
-			default:                              return "invalid";
-			}
+			return s == resolver_side::resolver_left ? "left" :
+				s == resolver_side::resolver_right ? "right" : "?";
 		};
 
 	const auto safety_name = [](int s) -> const char*
 		{
-			if (s >= penetration::safety_full)
-				return "full";
-			if (s >= penetration::safety_no_roll)
-				return "no_roll";
+			if (s >= penetration::safety_full) return "full";
+			if (s >= penetration::safety_no_roll) return "no_roll";
 			return "none";
 		};
-
-	const auto dir = shot->record.m_shot_dir;
-	const auto side = shot->record.m_resolver_side;
-	const auto mode = shot->record.m_resolver_mode;
-
-	char name[128] = "unknown";
-	player_info_t info{};
-	if (interfaces::engine()->GetPlayerInfo(shot->enemy_index, &info))
-		strcpy_s(name, info.name);
 
 	if (shot->hurt && globals::nospread && shot->hitinfo.hitgroup == HITGROUP_HEAD && !shot->record.m_shot)
 		log.nospread.m_pitch_cycle = 0;
 
 	interfaces::cvar()->ConsoleColorPrintf(Color(235, 5, 90), xorstr_("[fatality] "));
 
+	const auto dir = shot->record.m_shot_dir;
+	const auto side = shot->record.m_resolver_side;
+
 	if (shot->hurt)
 	{
 		util::print_dev_console(true, Color(100, 255, 100),
-			xorstr_("hit %s - dir=%s side=%s mode=%s safety=%s dmg=%d hc=%.0f\n"),
-			name,
-			dir_name(dir),
-			side_name(side),
-			mode_name(mode),
-			safety_name(shot->safety),
+			xorstr_("hit - dir=%s side=%s safety=%s dmg=%d hc=%.0f\n"),
+			dir_name(dir), side_name(side), safety_name(shot->safety),
 			shot->hitinfo.damage > 0 ? shot->hitinfo.damage : shot->damage,
 			shot->hitchance);
 		return;
@@ -1486,14 +1629,9 @@ void resolver::calc_missed_shots(shot_t* shot)
 		log.m_shots++;
 
 		util::print_dev_console(true, Color(255, 80, 80),
-			xorstr_("missed %s due to resolver - dir=%s side=%s mode=%s safety=%s dmg=%d hc=%.0f\n"),
-			name,
-			dir_name(dir),
-			side_name(side),
-			mode_name(mode),
-			safety_name(shot->safety),
-			shot->damage,
-			shot->hitchance);
+			xorstr_("miss resolve - dir=%s side=%s safety=%s dmg=%d hc=%.0f\n"),
+			dir_name(dir), side_name(side), safety_name(shot->safety),
+			shot->damage, shot->hitchance);
 		return;
 	}
 
@@ -1506,15 +1644,9 @@ void resolver::calc_missed_shots(shot_t* shot)
 		reason = "server correction";
 
 	util::print_dev_console(true, Color(255, 180, 80),
-		xorstr_("missed %s due to %s - dir=%s side=%s mode=%s safety=%s dmg=%d hc=%.0f\n"),
-		name,
-		reason,
-		dir_name(dir),
-		side_name(side),
-		mode_name(mode),
-		safety_name(shot->safety),
-		shot->damage,
-		shot->hitchance);
+		xorstr_("miss %s - dir=%s side=%s safety=%s dmg=%d hc=%.0f\n"),
+		reason, dir_name(dir), side_name(side), safety_name(shot->safety),
+		shot->damage, shot->hitchance);
 }
 
 void resolver::set_local_info()
