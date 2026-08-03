@@ -38,45 +38,86 @@ void tickbase::adjust_limit_dynamic(CUserCmd* cmd)
 	if (!wpn || !ready || animations::most_recent.second != interfaces::client_state()->lastoutgoingcommand)
 		return;
 
+	// === Features are currently OFF → instant full discharge ===
+	if (!fast_fire && !hide_shot)
+	{
+		to_recharge = 0;
+
+		const int current = compute_current_limit();
+		if (current > 0)
+			to_shift = current;          // dump everything immediately (teleport)
+		else
+			to_shift = 0;
+
+		keep_config_changed = false;
+		return;
+	}
+
+	// === Features are ON ===
+
 	const auto info = interfaces::weapon_system()->GetWpnData(wpn->get_weapon_id());
 	if (!info)
 		return;
 
-	auto dont_recharge = wpn->is_grenade() && ((wpn->get_pin_pulled() || wpn->get_throw_time() != 0.f) ||
-		aimbot::last_target != -1 || prediction::had_attack || cmd->weaponselect);
-	if (dont_recharge)
-		keep_config_changed = false;
+	bool dont_recharge = false;
 
-	const auto diff_wpn = wpn->get_next_primary_attack() - interfaces::globals()->curtime;
-	if (!dont_recharge && !changed && fast_fire && (wpn->is_shootable() || wpn->is_knife()) &&
-		((info->cycle_time < .55f && diff_wpn > -.2f) || diff_wpn > .7f) && (wpn->is_knife() || !wpn->in_reload()))
+	if (wpn->is_grenade() && (wpn->get_pin_pulled() || wpn->get_throw_time() != 0.f))
 		dont_recharge = true;
 
-	const auto diff_player = local_player->get_next_attack() - interfaces::globals()->curtime;
-	if (!dont_recharge && diff_player > .7f)
+	if (aimbot::last_target != -1 || prediction::had_attack || cmd->weaponselect)
+		dont_recharge = true;
+
+	const float diff_wpn = wpn->get_next_primary_attack() - interfaces::globals()->curtime;
+	const float diff_player = local_player->get_next_attack() - interfaces::globals()->curtime;
+
+	if (!dont_recharge && !changed && (wpn->is_shootable() || wpn->is_knife()))
+	{
+		if ((info->cycle_time < 0.55f && diff_wpn > -0.2f) || diff_wpn > 0.7f)
+		{
+			if (wpn->is_knife() || !wpn->in_reload())
+				dont_recharge = true;
+		}
+	}
+
+	if (!dont_recharge && diff_player > 0.7f)
 		dont_recharge = true;
 
 	if (keep_config_changed)
 		dont_recharge = false;
 
 	if (dont_recharge)
+	{
 		to_recharge = 0;
+		return;
+	}
 
-	const auto diff = determine_optimal_limit() - compute_current_limit();
-	const auto standing = prediction::get_pred_info((cmd->command_number - 1)).velocity.Length() < 1.1f &&
-		prediction::unpred_move.x == 0.f && prediction::unpred_move.y == 0.f;
-	if (!dont_recharge && diff > 0 && (diff > 2 || standing))
+	const int optimal = determine_optimal_limit();
+	const int current = compute_current_limit();
+	const int diff = optimal - current;
+
+	constexpr int deadzone = 2;
+
+	if (diff > deadzone)
 	{
 		to_recharge = diff;
 		to_shift = 0;
 	}
-	else if (diff < 0)
+	else if (diff < -deadzone)
 	{
 		to_recharge = 0;
 		to_shift = -diff;
 	}
+	else
+	{
+		// Stabilize
+		if (to_recharge > 0 && current >= optimal - 1)
+			to_recharge = 0;
 
-	if (!diff)
+		if (to_shift > 0 && current <= optimal + 1)
+			to_shift = 0;
+	}
+
+	if (diff == 0)
 		keep_config_changed = false;
 }
 
@@ -87,15 +128,42 @@ bool tickbase::attempt_shift_back(bool& send_packet)
 		return true;
 
 	const auto is_revolver = weapon->get_weapon_id() == WEAPON_REVOLVER;
+	const int cur_limit = compute_current_limit();
 
-	const auto dont = (fast_fire || hide_shot) && is_revolver || globals::shot_command <= interfaces::client_state()->lastoutgoingcommand || to_shift > 0;
+	// Weapon-aware threshold (point 3)
+	// Fast weapons need to shift back earlier so they finish recharging before next fire window
+	int shift_back_threshold = 3;
 
-	if (compute_current_limit() > 3 && local_player->get_tickbase() > animations::lag.first && !dont)
+	if (weapon->is_knife())
+		shift_back_threshold = 4;
+	else if (weapon->get_weapon_id() == WEAPON_REVOLVER)
+		shift_back_threshold = 5;
+	else
 	{
-		const auto predicted_time = interfaces::globals()->curtime + ticks_to_time(compute_current_limit());
+		const auto info = interfaces::weapon_system()->GetWpnData(weapon->get_weapon_id());
+		if (info)
+		{
+			const float cycle = info->cycle_time;
+			if (cycle < 0.25f)          // very fast weapons (pistols, etc.)
+				shift_back_threshold = 2;
+			else if (cycle < 0.45f)
+				shift_back_threshold = 3;
+			else
+				shift_back_threshold = 4;
+		}
+	}
+
+	const bool dont = (fast_fire || hide_shot) && is_revolver
+		|| globals::shot_command <= interfaces::client_state()->lastoutgoingcommand
+		|| to_shift > 0;
+
+	if (cur_limit > shift_back_threshold && local_player->get_tickbase() > animations::lag.first && !dont)
+	{
+		const auto predicted_time = interfaces::globals()->curtime + ticks_to_time(cur_limit);
 		const auto release_tick = time_to_ticks(weapon->get_next_secondary_attack() - predicted_time);
 
-		skip_next_adjust = !is_revolver || release_tick > 1 && release_tick < 10 - interfaces::client_state()->chokedcommands;
+		skip_next_adjust = !is_revolver || (release_tick > 1 && release_tick < 10 - interfaces::client_state()->chokedcommands);
+
 		if (skip_next_adjust)
 			send_packet = true;
 
@@ -105,18 +173,21 @@ bool tickbase::attempt_shift_back(bool& send_packet)
 		prediction::take_shot(false);
 		if (!is_revolver)
 			prediction::take_secondary_shot(false);
-		globals::shot_command = 0;
 
+		globals::shot_command = 0;
 		misc::retract_peek = false;
 
 		return false;
 	}
 
+	// Fast-fire / doubletap path
 	if (fast_fire)
 	{
 		to_shift = determine_optimal_shift();
-		if (compute_current_limit() - to_shift < 3)
-			to_shift = compute_current_limit();
+
+		// Leave a small buffer so we don't go completely dry
+		if (cur_limit - to_shift < 2)
+			to_shift = std::max(0, cur_limit - 1);
 
 		send_packet = true;
 	}
@@ -134,32 +205,47 @@ void tickbase::on_send_command(int command_number)
 	to_adjust = 0;
 
 	const auto wpn = local_weapon;
-
 	auto& p1 = prediction::get_pred_info(command_number);
+
 	if (p1.sequence != command_number)
 		return;
 
 	p1.tickbase.sent_commands = interfaces::client_state()->chokedcommands + 1;
 
-	if (((fast_fire && vars::aim.doubletap->get<bool>()) || hide_shot) &&
-		wpn->get_weapon_id() != WEAPON_REVOLVER && antiaim::started_peek_fakelag() && !to_shift)
+	// Multi-feature priority: doubletap > hideshot > fakeduck
+	const bool want_dt = fast_fire && vars::aim.doubletap->get<bool>();
+	const bool want_hs = !want_dt && hide_shot && vars::aim.silent->get<bool>();
+	const bool want_fd = vars::aim.fake_duck->get<bool>();
+
+	// During peek fakelag we force skip adjust for clean DT / HS
+	if ((want_dt || want_hs) && wpn && wpn->get_weapon_id() != WEAPON_REVOLVER &&
+		antiaim::started_peek_fakelag() && !to_shift)
+	{
 		skip_next_adjust = true;
+	}
 
 	if (skip_next_adjust)
+	{
 		interfaces::prediction()->get_predicted_commands() =
-		clamp(interfaces::client_state()->lastoutgoingcommand - interfaces::client_state()->last_command_ack, 0,
-			interfaces::prediction()->get_predicted_commands());
+			clamp(interfaces::client_state()->lastoutgoingcommand - interfaces::client_state()->last_command_ack,
+				0, interfaces::prediction()->get_predicted_commands());
+	}
 	else
+	{
 		to_adjust = p1.tickbase.limit;
+	}
 
+	// Propagate skip flag to all commands in the batch
 	for (auto i = interfaces::client_state()->lastoutgoingcommand + 1; i <= command_number; i++)
 	{
 		auto& p2 = prediction::get_pred_info(i);
 		if (p2.sequence != i)
 			continue;
+
 		p2.tickbase.skip_fake_commands = skip_next_adjust;
 	}
 
+	// Keep limit tracking up to date
 	compute_current_limit(command_number);
 }
 
@@ -268,10 +354,53 @@ int tickbase::determine_optimal_shift()
 	if (!info)
 		return 0;
 
-	constexpr auto min_shift_amt = 4;
-	const auto max_shift_amt = compute_current_limit();
+	const int max_limit = compute_current_limit();
+	if (max_limit <= 0)
+		return 0;
 
-	return clamp(wpn->is_secondary_attack_weapon() || wpn->get_weapon_id() == WEAPON_REVOLVER || vars::misc.peek_assist->get<bool>() ? max_shift_amt : time_to_ticks(info->cycle_time) - 1, min_shift_amt, max_shift_amt);
+	// Base values
+	constexpr int min_shift = 4;
+	int desired = max_limit;
+
+	// Dynamic adjustment based on ping
+	const float rtt = misc::get_latency();          // your existing latency helper
+	tick_interval = interfaces::globals()->interval_per_tick;
+	const int ping_ticks = time_to_ticks(rtt);
+
+	// On higher ping the server is more likely to clamp large shifts
+	if (ping_ticks > 12)
+		desired = std::min(desired, max_limit - 2);
+	else if (ping_ticks > 7)
+		desired = std::min(desired, max_limit - 1);
+
+	// Weapon-aware shift
+	if (wpn->is_secondary_attack_weapon() || wpn->get_weapon_id() == WEAPON_REVOLVER)
+	{
+		// Revolvers / secondary attack weapons need almost the full limit
+		desired = max_limit;
+	}
+	else if (wpn->is_knife())
+	{
+		desired = std::min(desired, 7);
+	}
+	else
+	{
+		// Normal guns: try to leave a small buffer so we can still recharge
+		const int cycle_ticks = time_to_ticks(info->cycle_time);
+		desired = std::clamp(cycle_ticks - 1, min_shift, max_limit);
+	}
+
+	// Peek assist wants maximum shift
+	if (vars::misc.peek_assist->get<bool>())
+		desired = max_limit;
+
+	// Lag-comp window consideration
+	// Shifting forward by N ticks also extends the server's lag-comp window by N ticks.
+	// We prefer a value that still gives good backtrack depth.
+	const int safe_shift = std::clamp(desired, min_shift, max_limit);
+
+	// Final safety clamp
+	return std::clamp(safe_shift, min_shift, max_limit);
 }
 
 int tickbase::determine_optimal_limit()
